@@ -42,7 +42,7 @@ Optional top-level `physics` values override defaults individually:
 
 For example, adding `"physics": {"gravity": [0, 0, 0], "friction": 0.5}` changes only gravity and friction. Density must be positive, material coefficients nonnegative, and all supplied numbers finite. Unknown `physics` keys are rejected. Contact gap is zero. Simulation uses 60 frames/s, ten substeps/frame, and twenty solver iterations. Joint stabilization uses `rigid_avbd_joint_alpha=0.0` to correct the full pin residual each substep.
 
-The pin targets are written into the world-frame joint anchors before each physics substep. Collision detection is enabled throughout playback, with directly connected neighbors filtered as in Newton's rod builder. An initial contact causes an error; the script does not move coordinates to hide intersections.
+The pin targets are written into the world-frame joint anchors before each physics substep. The targets of every substep are precomputed at start into a device table, so a frame needs no host work: on CUDA its ten substeps are captured once as a CUDA graph and replayed each frame, which removes the Python kernel-launch overhead that otherwise dominates. On CPU the same substeps run directly. Collision detection is enabled throughout playback, with directly connected neighbors filtered as in Newton's rod builder. An initial contact causes an error; the script does not move coordinates to hide intersections.
 
 **Tests**
 
@@ -53,6 +53,13 @@ uv run --extra examples agent/example_cable_braid.py \
 PYTHONDONTWRITEBYTECODE=1 UV_CACHE_DIR=./agent/cache/uv \
   WARP_CACHE_PATH=./agent/cache/warp TMPDIR=./agent/tmp \
   uv run --extra examples -m unittest -v agent.test_cable_braid
+```
+
+The graph-replay test (`TestGraphCapture`) runs only when a CUDA device is available and is skipped otherwise. To measure simulation speed without the default 60 FPS render cap:
+
+```bash
+time uv run --extra examples agent/example_cable_braid.py \
+  --viewer null --no-paused --num-frames 300 --render-fps 10000
 ```
 
 For the existing installed environment, replace `--extra examples` with `--no-sync --offline` to run without dependency synchronization. The script directs its default Warp cache and viewer output files into `agent/`.

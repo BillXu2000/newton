@@ -21,6 +21,8 @@ Input semantics (see README_braid.md for the schema):
     ``start``, ``mid`` and ``end`` at uniform angular speed. Yarns absent from a step
     hold position. After the last step all targets hold while physics continues.
   * ``feed`` is validated but not simulated; a warning is issued if any is nonzero.
+  * On CUDA, one frame's substeps are captured as a CUDA graph and replayed each frame; bottom
+    targets for every substep are precomputed into a device table for that reason.
 
 Optional physics keys override DEFAULT_PHYSICS individually. Units: gravity [m/s²],
 density [kg/m³], stretch/shear/contact stiffness [N/m], stretch/shear/contact
@@ -290,13 +292,25 @@ class SceneConfig:
 @wp.kernel
 def update_pin_targets(
     joint_ids: wp.array[wp.int32],
-    positions: wp.array[wp.vec3],
+    target_table: wp.array2d[wp.vec3],
+    substep_count: wp.array[wp.int32],
+    substep_offset: int,
     joint_frames: wp.array[wp.transform],
 ):
-    """Translate selected world-parent joint frames without changing orientation."""
+    """Translate selected world-parent joint frames to the next substep's targets without changing orientation.
+
+    Row ``k`` of ``target_table`` holds the targets after ``k`` completed substeps; rows past the end hold.
+    """
     i = wp.tid()
+    row = wp.min(substep_count[0] + substep_offset + 1, target_table.shape[0] - 1)
     joint = joint_ids[i]
-    joint_frames[joint] = wp.transform(positions[i], wp.transform_get_rotation(joint_frames[joint]))
+    joint_frames[joint] = wp.transform(target_table[row, i], wp.transform_get_rotation(joint_frames[joint]))
+
+
+@wp.kernel
+def advance_substep_count(substep_count: wp.array[wp.int32], substeps: int):
+    """Advance the device-side substep counter by one frame (single thread)."""
+    substep_count[0] = substep_count[0] + substeps
 
 
 def add_endpoint_pins(builder: newton.ModelBuilder, bodies: list[int], points: np.ndarray) -> tuple[int, int]:
@@ -363,6 +377,7 @@ class Example:
         self.config = config if config is not None else SceneConfig.load(args.input)
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
+        # Even, so the captured state_0/state_1 swaps return to the starting buffers each frame.
         self.sim_substeps = 10
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.sim_time = 0.0
@@ -384,9 +399,15 @@ class Example:
         # Correct the full pin residual each substep instead of retaining motion lag.
         self.solver = newton.solvers.SolverVBD(self.model, iterations=20, rigid_avbd_joint_alpha=0.0)
         self.bottom_pin_ids = wp.array(self.bottom_pins, dtype=wp.int32, device=self.model.device)
-        self.target_positions = wp.empty(len(self.bottom_pins), dtype=wp.vec3, device=self.model.device)
+        self.target_table = wp.array(self._target_table(), dtype=wp.vec3, device=self.model.device)
+        self.device_substep_count = wp.zeros(1, dtype=wp.int32, device=self.model.device)
         self.viewer.set_model(self.model)
         self._frame_camera()
+        self.graph = None
+        if self.model.device.is_cuda:
+            with wp.ScopedCapture(device=self.model.device) as capture:
+                self.simulate()
+            self.graph = capture.graph
         count = len(self.config.cables)
         print(f"Yarns: {[c.yarn for c in self.config.cables]}")
         print(
@@ -414,29 +435,47 @@ class Example:
         if hasattr(self.viewer, "camera"):
             self.viewer.camera.look_at(wp.vec3(*center))
 
-    def _apply_bottom_targets(self, time: float):
-        positions = self.config.bottom_positions(time).astype(np.float32)
-        self.target_positions.assign(positions)
-        wp.launch(
-            update_pin_targets,
-            dim=len(self.bottom_pins),
-            inputs=[self.bottom_pin_ids, self.target_positions],
-            outputs=[self.model.joint_X_p],
-            device=self.model.device,
-        )
-        self.solver.notify_model_changed(newton.ModelFlags.JOINT_PROPERTIES)
+    def _target_table(self) -> np.ndarray:
+        """Bottom targets [m] after k completed substeps, shape [row_count, cable_count, 3].
 
-    def step(self):
-        """Advance one frame with substep arc interpolation and collision detection."""
-        for _ in range(self.sim_substeps):
-            next_time = (self.substep_count + 1) / (self.fps * self.sim_substeps)
-            self._apply_bottom_targets(next_time)
+        Precomputed so each substep needs no host work and a frame can be captured as a CUDA graph.
+        The last row is the final hold, reached once playback ends.
+        """
+        substeps_per_second = self.fps * self.sim_substeps
+        row_count = math.ceil(self.config.playback_duration * substeps_per_second) + 2
+        return np.array([self.config.bottom_positions(k / substeps_per_second) for k in range(row_count)], np.float32)
+
+    def simulate(self):
+        """Advance one frame of substeps on the device, with no host work, so it can be graph-captured."""
+        for substep in range(self.sim_substeps):
+            # Only ball-joint frames change, so no solver.notify_model_changed() is needed: its JOINT_PROPERTIES
+            # refresh covers cable-joint rest invariants only.
+            wp.launch(
+                update_pin_targets,
+                dim=len(self.bottom_pins),
+                inputs=[self.bottom_pin_ids, self.target_table, self.device_substep_count, substep],
+                outputs=[self.model.joint_X_p],
+                device=self.model.device,
+            )
             self.state_0.clear_forces()
             self.viewer.apply_forces(self.state_0)
             self.collision_pipeline.collide(self.state_0, self.contacts)
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
-            self.substep_count += 1
+        wp.launch(
+            advance_substep_count,
+            dim=1,
+            inputs=[self.device_substep_count, self.sim_substeps],
+            device=self.model.device,
+        )
+
+    def step(self):
+        """Advance one frame with substep arc interpolation and collision detection."""
+        if self.graph:
+            wp.capture_launch(self.graph)
+        else:
+            self.simulate()
+        self.substep_count += self.sim_substeps
         self.sim_time = self.substep_count / (self.fps * self.sim_substeps)
 
     def render(self):
