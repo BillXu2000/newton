@@ -20,6 +20,7 @@ import warnings
 from pathlib import Path
 
 import numpy as np
+import warp as wp
 
 AGENT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(AGENT_DIR))
@@ -296,6 +297,34 @@ class TestTracking(unittest.TestCase):
             tilts.append(math.degrees(math.acos(np.clip(axis @ rest / np.linalg.norm(rest), -1, 1))))
         self.assertGreater(max(tilts), 1.0)
         example.test_final()
+
+
+@unittest.skipUnless(wp.is_cuda_available(), "requires a CUDA device")
+class TestGraphCapture(unittest.TestCase):
+    def test_graph_replay_matches_eager_cuda(self):
+        """Replay the captured frame graph on CUDA and match eager execution of the same substeps.
+
+        Covers the first 1.5 s of the supplied input: a full step with all yarns moving and half of a
+        step where two hold. The graph run must also advance its device-side targets every frame.
+        """
+        import newton  # noqa: PLC0415
+
+        config = _load_quiet(INPUT_PATH)
+        args = Example.create_parser().parse_args(["--viewer", "null", "--device", "cuda:0"])
+        graph = Example(newton.viewer.ViewerNull(), args, config)
+        eager = Example(newton.viewer.ViewerNull(), args, config)
+        self.assertIsNotNone(graph.graph)
+        eager.graph = None
+        for _ in range(90):
+            graph.step()
+            eager.step()
+            targets = graph.model.joint_X_p.numpy()[graph.bottom_pins, :3]
+            np.testing.assert_allclose(targets, config.bottom_positions(graph.sim_time), atol=1e-6)
+            self.assertLess(graph.pin_error(), 1.0e-4)
+        np.testing.assert_allclose(graph.model.joint_X_p.numpy(), eager.model.joint_X_p.numpy(), atol=1e-6)
+        # Atomic accumulation order may differ between runs, so allow small drift in the dynamic bodies.
+        np.testing.assert_allclose(graph.state_0.body_q.numpy()[:, :3], eager.state_0.body_q.numpy()[:, :3], atol=1e-3)
+        graph.test_final()
 
 
 if __name__ == "__main__":
