@@ -16,8 +16,9 @@ wp.set_module_options({"enable_backward": False})
 
 float32 = wp.float32
 int32 = wp.int32
-mat33f = wp.mat33f
+uint64 = wp.uint64
 vec2f = wp.vec2f
+vec2i = wp.vec2i
 
 
 @wp.struct
@@ -33,26 +34,17 @@ class DVIConfigStruct:
     omega: float32
     """Projected Gauss-Seidel update relaxation."""
 
-    max_iterations: int32
-    """Maximum projected Gauss-Seidel iterations for the fallback path."""
+    max_alternating_iterations: int32
+    """Outer projected-inequality blocks, with direct bilateral solves when available."""
 
-    block_iterations: int32
-    """Outer direct-bilateral/projected-inequality block iterations."""
-
-    contact_iterations: int32
+    inequality_sweeps_per_iteration: int32
     """Projected sweeps for unilateral inequalities in each direct-bilateral block."""
 
-    bilateral_solve_period: int32
+    tangential_warmstart_scale: float32
+    """Scale applied to cached tangential reactions before each solve."""
+
+    bilateral_solve_interval: int32
     """Block iteration period for repeated direct bilateral solves."""
-
-    contact_jacobi_omega: float32
-    """Step size for contact Jacobi and block-preconditioned updates."""
-
-    contact_jacobi_relaxation: float32
-    """Solution mixing for contact Jacobi and block-preconditioned updates."""
-
-    contact_block_preconditioner: wp.bool
-    """Whether to use the full contact 3x3 diagonal block for projected updates."""
 
 
 @wp.struct
@@ -64,11 +56,11 @@ class DVIStatus:
     iterations: int32
     """Projected sweeps; direct-bilateral solves report block/contact sweeps."""
     r_p: float32
-    """Primal cone-feasibility residual."""
+    """Maximum primal box- and cone-feasibility residual."""
     r_d: float32
     """Maximum dual cone-feasibility and bilateral velocity residual."""
     r_c: float32
-    """Maximum absolute impulse-velocity inner product."""
+    """Maximum absolute impulse-velocity product, directional on box rows."""
     r_b: float32
     """Bilateral constraint-space velocity residual."""
 
@@ -104,9 +96,27 @@ class DVIState:
         self.bilateral_solution: wp.array[float32] | None = None
         self.bilateral_preconditioner: wp.array[float32] | None = None
         self.bilateral_active_dim: wp.array[int32] | None = None
-        self.contact_block_inv: wp.array[mat33f] | None = None
-        self.contact_colors: wp.array[int32] | None = None
-        self.contact_num_colors: wp.array[int32] | None = None
+        self.limit_indices: wp.array[int32] | None = None
+        self.contact_indices: wp.array[int32] | None = None
+        self.inequality_bodies: wp.array[vec2i] | None = None
+        self.inequality_body_color_masks: wp.array[uint64] | None = None
+        self.inequality_colors: wp.array[int32] | None = None
+        self.inequality_num_colors: wp.array[int32] | None = None
+        self.inequality_ids_by_color: wp.array[int32] | None = None
+        self.inequality_color_starts: wp.array[int32] | None = None
+        self.inequality_group_starts: wp.array[int32] | None = None
+        self.inequality_tangent_cross: wp.array[float32] | None = None
+        self.inequality_projected_diagonal: wp.array[float32] | None = None
+        self.projected_D: wp.array[float32] | None = None
+        self.projected_mio: wp.array[int32] | None = None
+        self.bilateral_coupling: wp.array[float32] | None = None
+        self.bilateral_response_mio: wp.array[int32] | None = None
+        self.bilateral_response_stride: wp.array[int32] | None = None
+        self.bilateral_response_factor: wp.array[float32] | None = None
+        self.bilateral_response: wp.array[float32] | None = None
+        self.bilateral_factor_row_start: wp.array[int32] | None = None
+        self.bilateral_delta: wp.array[float32] | None = None
+        self._sparse_projection_allocated = False
         if size is not None:
             self.finalize(size)
 
@@ -116,16 +126,94 @@ class DVIState:
         self.v_aug = wp.zeros(size.sum_of_max_total_cts, dtype=float32)
         self.s = wp.zeros(size.sum_of_max_total_cts, dtype=float32)
         self.scratch = wp.zeros(size.sum_of_max_total_cts, dtype=float32)
-        self.bilateral_rhs = wp.zeros(size.sum_of_num_joint_cts, dtype=float32)
-        self.bilateral_solution = wp.zeros(size.sum_of_num_joint_cts, dtype=float32)
-        self.bilateral_preconditioner = wp.zeros(size.sum_of_num_joint_cts, dtype=float32)
+        self.bilateral_rhs = wp.zeros(size.sum_of_num_bilateral_joint_cts, dtype=float32)
+        self.bilateral_solution = wp.zeros(size.sum_of_num_bilateral_joint_cts, dtype=float32)
+        self.bilateral_preconditioner = wp.zeros(size.sum_of_num_bilateral_joint_cts, dtype=float32)
         self.bilateral_active_dim = wp.zeros(size.num_worlds, dtype=int32)
-        self.contact_block_inv = wp.zeros(max(1, size.sum_of_max_contacts), dtype=mat33f)
-        self.contact_colors = wp.full(max(1, size.sum_of_max_contacts), -1, dtype=int32)
-        self.contact_num_colors = wp.zeros(max(1, size.num_worlds), dtype=int32)
+        self.limit_indices = wp.full(max(1, size.sum_of_max_limits), -1, dtype=int32)
+        self.contact_indices = wp.full(max(1, size.sum_of_max_contacts), -1, dtype=int32)
+        self.inequality_bodies = wp.full(max(1, size.sum_of_max_inequalities), vec2i(-1, -1), dtype=vec2i)
+        self.inequality_body_color_masks = wp.zeros(max(1, size.sum_of_num_bodies), dtype=uint64)
+        self.inequality_colors = wp.full(max(1, size.sum_of_max_inequalities), -1, dtype=int32)
+        self.inequality_num_colors = wp.zeros(max(1, size.num_worlds), dtype=int32)
+        self.inequality_ids_by_color = wp.full(max(1, size.sum_of_max_inequalities), -1, dtype=int32)
+        self.inequality_color_starts = wp.zeros(max(1, size.sum_of_max_inequalities + size.num_worlds), dtype=int32)
+        # Sparse DVI only needs a harmless dummy permutation when RCM is disabled.
+        self.projected_mio = wp.zeros(max(1, size.num_worlds), dtype=int32)
 
-    def reset(self):
-        """Reset scratch arrays to zero."""
+    def allocate_dense_projection(self, size: SizeKamino) -> None:
+        """Allocate dense projected Delassus storage once.
+
+        Args:
+            size: Model dimensions that determine the flattened allocation.
+
+        Raises:
+            ValueError: If the flattened allocation exceeds int32 indexing.
+        """
+        if self.projected_D is None:
+            projected_stride = size.max_of_max_total_cts * size.max_of_max_total_cts
+            projected_size = size.num_worlds * projected_stride
+            if projected_size > 2**31 - 1:
+                raise ValueError("Dense DVI projection exceeds the supported int32 index range.")
+            self.projected_mio = wp.array([world * projected_stride for world in range(size.num_worlds)], dtype=int32)
+            self.projected_D = wp.zeros(max(1, projected_size), dtype=float32)
+
+    def allocate_sparse_projection(
+        self,
+        size: SizeKamino,
+        joint_rows: list[int],
+        unilateral_strides: list[int],
+        bilateral_vector_size: int,
+        use_schur_complement: bool,
+    ) -> None:
+        """Allocate sparse bilateral-projection workspace once.
+
+        Args:
+            size: Model dimensions for inequality scratch storage.
+            joint_rows: Bilateral joint-row count for each world.
+            unilateral_strides: Allocated unilateral row stride for each world.
+            bilateral_vector_size: Flattened size of the bilateral solution vector.
+            use_schur_complement: Whether to allocate the bilateral response matrices.
+
+        Raises:
+            ValueError: If the flattened response workspace exceeds int32 indexing.
+        """
+        if self.inequality_group_starts is None:
+            self.inequality_group_starts = wp.zeros(max(1, size.sum_of_max_inequalities + size.num_worlds), dtype=int32)
+            self.inequality_tangent_cross = wp.zeros(max(1, size.sum_of_max_inequalities), dtype=float32)
+            self.inequality_projected_diagonal = wp.zeros(max(1, size.sum_of_max_total_cts), dtype=float32)
+        if self.bilateral_coupling is None:
+            # Warp kernels require arrays even when their response terms are disabled.
+            self.bilateral_response_mio = wp.zeros(max(1, size.num_worlds), dtype=int32)
+            self.bilateral_response_stride = wp.zeros(max(1, size.num_worlds), dtype=int32)
+            self.bilateral_coupling = wp.zeros(1, dtype=float32)
+            self.bilateral_response_factor = wp.zeros(1, dtype=float32)
+            self.bilateral_response = wp.zeros(1, dtype=float32)
+            self.bilateral_delta = wp.zeros(1, dtype=float32)
+        if use_schur_complement and not self._sparse_projection_allocated:
+            response_offsets = []
+            response_size = 0
+            for num_joint_rows, unilateral_stride in zip(joint_rows, unilateral_strides, strict=True):
+                response_offsets.append(response_size)
+                response_size += num_joint_rows * unilateral_stride
+            if response_size > 2**31 - 1:
+                raise ValueError("Sparse DVI projection exceeds the supported int32 index range.")
+            self.bilateral_response_mio = wp.array(response_offsets, dtype=int32)
+            self.bilateral_response_stride = wp.array(unilateral_strides, dtype=int32)
+            self.bilateral_coupling = wp.zeros(max(1, response_size), dtype=float32)
+            self.bilateral_response_factor = wp.zeros(max(1, response_size), dtype=float32)
+            self.bilateral_response = wp.zeros(max(1, response_size), dtype=float32)
+            self.bilateral_delta = wp.zeros(max(1, bilateral_vector_size), dtype=float32)
+            self.bilateral_factor_row_start = wp.zeros(max(1, bilateral_vector_size), dtype=int32)
+            self._sparse_projection_allocated = True
+
+    def reset(self, *, clear_response: bool = True):
+        """Reset scratch arrays, optionally retaining overwritten response workspace.
+
+        Args:
+            clear_response: Whether to clear the three large response matrices.
+                Solves overwrite their active entries before reading them.
+        """
         self.sigma.zero_()
         self.v_aug.zero_()
         self.s.zero_()
@@ -134,9 +222,26 @@ class DVIState:
         self.bilateral_solution.zero_()
         self.bilateral_preconditioner.zero_()
         self.bilateral_active_dim.zero_()
-        self.contact_block_inv.zero_()
-        self.contact_colors.fill_(-1)
-        self.contact_num_colors.zero_()
+        self.limit_indices.fill_(-1)
+        self.contact_indices.fill_(-1)
+        self.inequality_bodies.fill_(vec2i(-1, -1))
+        self.inequality_body_color_masks.zero_()
+        self.inequality_colors.fill_(-1)
+        self.inequality_num_colors.zero_()
+        self.inequality_ids_by_color.fill_(-1)
+        self.inequality_color_starts.zero_()
+        if self.inequality_group_starts is not None:
+            self.inequality_group_starts.zero_()
+            self.inequality_tangent_cross.zero_()
+            self.inequality_projected_diagonal.zero_()
+        if self.projected_D is not None:
+            self.projected_D.zero_()
+        if self.bilateral_coupling is not None:
+            if clear_response:
+                self.bilateral_coupling.zero_()
+                self.bilateral_response_factor.zero_()
+                self.bilateral_response.zero_()
+            self.bilateral_delta.zero_()
 
 
 class DVIData:
@@ -174,11 +279,8 @@ def convert_config_to_struct(config: DVISolverConfig) -> DVIConfigStruct:
     config_struct.tolerance = config.tolerance
     config_struct.regularization = config.regularization
     config_struct.omega = config.omega
-    config_struct.max_iterations = config.max_iterations
-    config_struct.block_iterations = config.block_iterations
-    config_struct.contact_iterations = config.contact_iterations
-    config_struct.bilateral_solve_period = config.bilateral_solve_period
-    config_struct.contact_jacobi_omega = config.contact_jacobi_omega
-    config_struct.contact_jacobi_relaxation = config.contact_jacobi_relaxation
-    config_struct.contact_block_preconditioner = config.contact_block_preconditioner
+    config_struct.max_alternating_iterations = config.max_alternating_iterations
+    config_struct.inequality_sweeps_per_iteration = config.inequality_sweeps_per_iteration
+    config_struct.tangential_warmstart_scale = config.tangential_warmstart_scale
+    config_struct.bilateral_solve_interval = config.bilateral_solve_interval
     return config_struct

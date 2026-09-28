@@ -2,12 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import unittest
+from itertools import product
 
 import numpy as np
 import warp as wp
 import warp.fem as fem
+import warp.sparse as sp
 
 import newton
+from newton._src.solvers.implicit_mpm.implicit_mpm_solver_kernels import collision_weight_field
 from newton._src.solvers.implicit_mpm.rasterized_collisions import (
     _ALL_COLLIDER_WORLDS,
     Collider,
@@ -15,6 +18,7 @@ from newton._src.solvers.implicit_mpm.rasterized_collisions import (
     rasterize_collider_kernel,
 )
 from newton._src.solvers.implicit_mpm.solve_rheology import (
+    _ITERATIVE_LINEAR_SOLVERS,
     ArraySquaredNorm,
     _compute_environment_l2_tolerance_scales,
     _linear_solver_result_norms,
@@ -26,10 +30,49 @@ from newton.solvers.experimental.coupled import SolverCoupled, SolverCoupledProx
 from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
 
 
+def test_sparse_contact_preserves_first_interpolation(test, device):
+    """Preserve contact weights at nodes shared by an irregular number of cells."""
+    with wp.ScopedDevice(device):
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=(0.0, 0.0, 0.0))
+        SolverImplicitMPM.register_custom_attributes(builder)
+        for xyz in list(product((0, 1), repeat=3))[:7]:
+            builder.add_particle(tuple(0.025 + 0.1 * x for x in xyz), (0.0, 0.0, 0.0), 0.01, radius=0.01)
+        builder.add_ground_plane(height=0.05)
+        model = builder.finalize(device=device)
+        config = _make_mpm_config(grid_type="sparse")
+        config.separate_worlds = False
+        # Exercise automatic row construction on a small reserved grid too.
+        config.max_active_cell_count = 128
+        config.grid_padding = 0
+        config.velocity_basis = "Q1"
+        config.strain_basis = "P0"
+        config.collider_basis = "S3"
+        config.warmstart_mode = "particles"
+        solver, _ = _step_mpm(model, config, step_count=1)
+        scratch = solver._scratchpad
+        actual = scratch.collider_matrix
+        expected = sp.bsr_zeros(actual.nrow, actual.ncol, block_type=float)
+        fem.interpolate(
+            collision_weight_field,
+            dest=expected,
+            dest_space=scratch.collider_fraction_test.space,
+            at=scratch.collider_fraction_test.space_restriction,
+            reduction="first",
+            fields={"trial": scratch.fraction_trial, "normal": scratch.collider_normal_field},
+        )
+        count = actual.nnz_sync()
+        test.assertGreater(count, 0)
+        test.assertEqual(count, expected.nnz_sync())
+        test.assertEqual(actual.offsets.numpy().tobytes(), expected.offsets.numpy().tobytes())
+        test.assertEqual(actual.columns.numpy()[:count].tobytes(), expected.columns.numpy()[:count].tobytes())
+        test.assertEqual(actual.values.numpy()[:count].tobytes(), expected.values.numpy()[:count].tobytes())
+
+
 def _make_mpm_particle_builder(
     gravity=(0.0, -9.81, 0.0),
     velocity=(0.0, 0.0, 0.0),
     young_modulus=1.0e4,
+    initial_plastic_volume_strain=1.0,
     dimensions=(2, 2, 2),
 ):
     builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=gravity)
@@ -47,7 +90,11 @@ def _make_mpm_particle_builder(
         mass=0.01,
         jitter=0.0,
         radius_mean=0.025,
-        custom_attributes={"mpm:young_modulus": young_modulus, "mpm:poisson_ratio": 0.2},
+        custom_attributes={
+            "mpm:young_modulus": young_modulus,
+            "mpm:poisson_ratio": 0.2,
+            "mpm:particle_Jp": initial_plastic_volume_strain,
+        },
     )
     return builder
 
@@ -63,6 +110,14 @@ def _make_mpm_config(grid_type="dense", integration_scheme="pic", solver="jacobi
     config.tolerance = 0.0
     config.warmstart_mode = "grid"
     return config
+
+
+def test_expanded_iterative_solver_names(test, device):
+    """Verify expanded iterative solver names resolve to the existing implementations."""
+    del device
+    test.assertIs(_ITERATIVE_LINEAR_SOLVERS["conjugate-gradient"], _ITERATIVE_LINEAR_SOLVERS["cg"])
+    test.assertIs(_ITERATIVE_LINEAR_SOLVERS["conjugate-residual"], _ITERATIVE_LINEAR_SOLVERS["cr"])
+    test.assertIs(_ITERATIVE_LINEAR_SOLVERS["generalized-minimal-residual"], _ITERATIVE_LINEAR_SOLVERS["gmres"])
 
 
 def _make_two_world_particle_model(device, builder=None, local_builder=None):
@@ -642,7 +697,10 @@ def test_multiworld_global_particles_rejected(test, device):
 
 def test_single_world_global_particles_supported(test, device):
     """Verify single world global particles supported."""
-    model = _make_mpm_particle_builder().finalize(device=device)
+    initial_plastic_volume_strain = 0.975
+    model = _make_mpm_particle_builder(initial_plastic_volume_strain=initial_plastic_volume_strain).finalize(
+        device=device
+    )
     config = _make_mpm_config()
     config.collider_basis = "pic"
     config.strain_basis = "pic"
@@ -650,6 +708,7 @@ def test_single_world_global_particles_supported(test, device):
     solver, state = _step_mpm(model, config, step_count=1)
     test.assertTrue(np.isfinite(state.particle_q.numpy()).all())
     np.testing.assert_array_equal(model.particle_world.numpy(), -1)
+    test.assertTrue(np.all(state.particle_qd.numpy()[:, 1] < 0.0))
 
     impulse = solver._last_step_data.ws_impulse_field.dof_values
     stress = solver._last_step_data.ws_stress_field.dof_values
@@ -664,7 +723,10 @@ def test_single_world_global_particles_supported(test, device):
     np.testing.assert_array_equal(stress.numpy(), stress_values)
 
     solver.reset(state, world_mask=wp.array((False, True), dtype=wp.bool, device=device))
-    np.testing.assert_array_equal(state.mpm.particle_Jp.numpy(), 1.0)
+    np.testing.assert_array_equal(
+        state.mpm.particle_Jp.numpy(),
+        np.full(model.particle_count, initial_plastic_volume_strain, dtype=np.float32),
+    )
     np.testing.assert_array_equal(impulse.numpy(), np.zeros_like(impulse_values))
     np.testing.assert_array_equal(stress.numpy(), np.zeros_like(stress_values))
 
@@ -1446,6 +1508,22 @@ basic_cuda_devices = get_cuda_test_devices(mode="basic")
 
 class TestImplicitMPM(unittest.TestCase):
     pass
+
+
+add_function_test(
+    TestImplicitMPM,
+    "test_sparse_contact_preserves_first_interpolation",
+    test_sparse_contact_preserves_first_interpolation,
+    devices=basic_cuda_devices,
+)
+
+
+add_function_test(
+    TestImplicitMPM,
+    "test_expanded_iterative_solver_names",
+    test_expanded_iterative_solver_names,
+    devices=basic_devices,
+)
 
 
 add_function_test(

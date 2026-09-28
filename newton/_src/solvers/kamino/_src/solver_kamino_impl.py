@@ -56,7 +56,7 @@ from .kinematics.resets import (
     set_body_q,
     set_floating_base,
 )
-from .linalg import ConjugateResidualSolver, IterativeSolver, LinearSolverNameToType
+from .linalg import ConjugateResidualSolver, ConjugateResidualSolverFused, IterativeSolver, LinearSolverNameToType
 from .solvers.common import WarmStartMode
 from .solvers.dvi import DVISolver
 from .solvers.fk import ForwardKinematicsSolver
@@ -98,7 +98,7 @@ class SolverKaminoImpl(SolverBase):
     options for the linear solver and preconditioning.
     """
 
-    ResetCallbackType = Callable[["SolverKaminoImpl", StateKamino], None]
+    ResetCallbackType = Callable[["SolverKaminoImpl", StateKamino, "wp.array[wp.bool] | None"], None]
     """Defines the type signature for reset callback functions."""
 
     StepCallbackType = Callable[["SolverKaminoImpl", StateKamino, StateKamino, ControlKamino, ContactsKamino], None]
@@ -183,6 +183,20 @@ class SolverKaminoImpl(SolverBase):
                 " Defaulting to 'ConjugateResidualSolver' as the PADMM linear solver."
             )
             linear_solver_type = ConjugateResidualSolver
+
+        # ConjugateResidualSolverFused requires a BlockSparseMatrixFreeDelassusOperator,
+        # which is only built when both sparse_dynamics and sparse_jacobian are enabled.
+        if issubclass(linear_solver_type, ConjugateResidualSolverFused):
+            if not self._config.sparse_dynamics:
+                msg.warning(
+                    "ConjugateResidualSolverFused requires sparse dynamics. Enabling sparse_dynamics automatically."
+                )
+                self._config.sparse_dynamics = True
+            if not self._config.sparse_jacobian:
+                msg.warning(
+                    "ConjugateResidualSolverFused requires sparse Jacobians. Enabling sparse_jacobian automatically."
+                )
+                self._config.sparse_jacobian = True
 
         # If graph conditionals are disabled in the PADMM solver, ensure that they
         # are also disabled in the linear solver if it is an iterative solver.
@@ -270,11 +284,19 @@ class SolverKaminoImpl(SolverBase):
         if self._config.use_fk_solver:
             self._solver_fk = ForwardKinematicsSolver(model=self._model, config=self._config.fk)
 
-        # Create the time-integrator instance based on the config
+        # Contacts generated externally are evaluated at the start of a step, so they require
+        # Euler integration. Moreau-Jean is valid only with the internal mid-step detector.
         if self._config.integrator == "euler":
             self._integrator = IntegratorEuler(model=self._model)
         elif self._config.integrator == "moreau":
-            self._integrator = IntegratorMoreauJean(model=self._model)
+            if self._config.use_collision_detector:
+                self._integrator = IntegratorMoreauJean(model=self._model)
+            else:
+                msg.warning(
+                    "Falling back to the 'euler' integrator: 'moreau' requires "
+                    "`use_collision_detector=True` to generate contacts at the mid-point."
+                )
+                self._integrator = IntegratorEuler(model=self._model)
         else:
             raise ValueError(
                 f"Unsupported integrator type: Expected 'euler' or 'moreau', but got {self._config.integrator}."
@@ -345,6 +367,11 @@ class SolverKaminoImpl(SolverBase):
         Returns the dual forward dynamics problem.
         """
         return self._problem_fd
+
+    @property
+    def solver_status(self) -> wp.array[Any]:
+        """Returns the active forward dynamics backend's per-world status array."""
+        return self._solver_fd.data.status
 
     @property
     def solver_fd(self) -> PADMMSolver | DVISolver:
@@ -486,8 +513,24 @@ class SolverKaminoImpl(SolverBase):
         if isinstance(config.base_velocity, SolverKamino.ResetConfig.FromBaseU):
             _check_length(config.base_velocity.base_u, "config.base_velocity.base_u", self._model.size.num_worlds)
 
+        # Warn if any world does not have an assigned base body when base attributes are provided.
+        if (
+            not (
+                isinstance(config.base_pose, SolverKamino.ResetConfig.ToDefault)
+                or isinstance(config.base_pose, SolverKamino.ResetConfig.Preserve)
+            )
+            or not (
+                isinstance(config.base_velocity, SolverKamino.ResetConfig.ToDefault)
+                or isinstance(config.base_velocity, SolverKamino.ResetConfig.Preserve)
+            )
+        ) and self._model.info.has_world_without_base_body:
+            msg.warning(
+                "Some worlds have no free-floating base body assigned, possibly due to a non-free articulation root (fixed-base system). "
+                "Base pose/velocity resets will have no effect for those worlds."
+            )
+
         # Run the pre-reset callback if it has been set
-        self._run_pre_reset_callback(state_out=state)
+        self._run_pre_reset_callback(state_out=state, world_mask=world_mask)
 
         # Resolve target joint_q
         joint_q = None
@@ -602,12 +645,12 @@ class SolverKaminoImpl(SolverBase):
             if self._solver_fk is None:
                 raise RuntimeError("The FK solver must be enabled to use resets from joint coordinates.")
             self._solver_fk.run_fk_solve(
-                actuators_q=actuator_q,
-                bodies_q=state.q_i,
+                actuator_q=actuator_q,
+                body_q=state.q_i,
                 base_q=base_q,
-                actuators_u=actuator_u,
+                actuator_u=actuator_u,
                 base_u=base_u if actuator_u is not None else None,
-                bodies_u=state.u_i if actuator_u is not None else None,
+                body_u=state.u_i if actuator_u is not None else None,
                 world_mask=world_mask,
             )
         elif isinstance(config.body_poses, SolverKamino.ResetConfig.ToDefault):
@@ -620,9 +663,9 @@ class SolverKaminoImpl(SolverBase):
             if self._solver_fk is None:
                 raise RuntimeError("The FK solver must be enabled to use resets from joint velocities.")
             self._solver_fk.solve_for_body_velocities(
-                actuators_u=actuator_u,
-                bodies_q=state.q_i,
-                bodies_u=state.u_i,
+                actuator_u=actuator_u,
+                body_q=state.q_i,
+                body_u=state.u_i,
                 base_u=base_u,
                 target_rel_transforms=None,
                 world_mask=world_mask,
@@ -655,14 +698,14 @@ class SolverKaminoImpl(SolverBase):
         if success_mask is not None:
             # Currently, only the position-level (iterative) FK solve can fail
             if actuator_q is not None:
-                wp.copy(success_mask, self._solver_fk.newton_success)
+                wp.copy(success_mask, self._solver_fk.data.gauss_newton.success)
             elif world_mask is not None:
                 wp.copy(success_mask, world_mask)
             else:
                 success_mask.fill_(True)
 
         # Run the post-reset callback if it has been set
-        self._run_post_reset_callback(state_out=state)
+        self._run_post_reset_callback(state_out=state, world_mask=world_mask)
 
     @override
     def step(
@@ -750,19 +793,19 @@ class SolverKaminoImpl(SolverBase):
     # Internals - Callback Operations
     ###
 
-    def _run_pre_reset_callback(self, state_out: StateKamino):
+    def _run_pre_reset_callback(self, state_out: StateKamino, world_mask: wp.array[wp.bool] | None):
         """
         Runs the pre-reset callback if it has been set.
         """
         if self._pre_reset_cb is not None:
-            self._pre_reset_cb(self, state_out)
+            self._pre_reset_cb(self, state_out, world_mask)
 
-    def _run_post_reset_callback(self, state_out: StateKamino):
+    def _run_post_reset_callback(self, state_out: StateKamino, world_mask: wp.array[wp.bool] | None):
         """
         Runs the post-reset callback if it has been set.
         """
         if self._post_reset_cb is not None:
-            self._post_reset_cb(self, state_out)
+            self._post_reset_cb(self, state_out, world_mask)
 
     def _run_prestep_callback(
         self, state_in: StateKamino, state_out: StateKamino, control: ControlKamino, contacts: ContactsKamino
@@ -813,7 +856,10 @@ class SolverKaminoImpl(SolverBase):
         wp.copy(self._data.joints.q_j, state_in.q_j)
         wp.copy(self._data.joints.q_j_p, state_in.q_j_p)
         wp.copy(self._data.joints.dq_j, state_in.dq_j)
-        wp.copy(self._data.joints.lambda_j, state_in.lambda_j)
+        wp.copy(self._data.joints.lambda_kin_j, state_in.lambda_kin_j)
+        wp.copy(self._data.joints.lambda_dyn_j, state_in.lambda_dyn_j)
+        wp.copy(self._data.joints.lambda_f_j, state_in.lambda_f_j)
+        wp.copy(self._data.joints.lambda_tau_j, state_in.lambda_tau_j)
         # Alias read-only control inputs
         self._data.joints.tau_j = control_in.tau_j
         self._data.joints.q_j_ref = control_in.q_j_ref
@@ -833,7 +879,10 @@ class SolverKaminoImpl(SolverBase):
         wp.copy(state_out.q_j, self._data.joints.q_j)
         wp.copy(state_out.q_j_p, self._data.joints.q_j_p)
         wp.copy(state_out.dq_j, self._data.joints.dq_j)
-        wp.copy(state_out.lambda_j, self._data.joints.lambda_j)
+        wp.copy(state_out.lambda_kin_j, self._data.joints.lambda_kin_j)
+        wp.copy(state_out.lambda_dyn_j, self._data.joints.lambda_dyn_j)
+        wp.copy(state_out.lambda_f_j, self._data.joints.lambda_f_j)
+        wp.copy(state_out.lambda_tau_j, self._data.joints.lambda_tau_j)
 
     ###
     # Internals - Reset Operations
@@ -1097,7 +1146,7 @@ class SolverKaminoImpl(SolverBase):
         # If a collision detector is provided, use it to generate
         # update the set of active contacts at the current state
         if detector is not None:
-            detector.collide(data=self._data, state=state_in, contacts=contacts)
+            detector.collide(data=self._data, contacts=contacts)
 
         # If a limits container/detector is provided, run joint-limit
         # detection to generate active joint limits at the current state

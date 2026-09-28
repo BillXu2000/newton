@@ -8,15 +8,22 @@ from __future__ import annotations
 import warp as wp
 
 from ...core.math import FLOAT32_EPS
-from ..padmm.math import project_to_coulomb_cone, project_to_coulomb_dual_cone
-from .projections import (
-    contact_trace_preconditioner as _contact_trace_preconditioner,
+from ..padmm.math import (
+    compute_box_complementarity_residual,
+    project_to_coulomb_cone,
+    project_to_coulomb_dual_cone,
 )
 from .projections import (
-    project_contact_block_update as _project_contact_block_update,
+    contact_friction_normal_load as _contact_friction_normal_load,
 )
 from .projections import (
-    project_contact_diagonal_update as _project_contact_diagonal_update,
+    project_box_update as _project_box_update,
+)
+from .projections import (
+    project_contact_normal_update as _project_contact_normal_update,
+)
+from .projections import (
+    project_contact_tangent_update as _project_contact_tangent_update,
 )
 from .types import DVIConfigStruct, DVIStatus
 
@@ -24,8 +31,10 @@ wp.set_module_options({"enable_backward": False})
 
 float32 = wp.float32
 int32 = wp.int32
-mat33f = wp.mat33f
 vec3f = wp.vec3f
+
+_FUSED_INEQUALITY_BLOCK = -2
+_FUSED_BILATERAL_BLOCK = -3
 
 
 @wp.func
@@ -90,6 +99,29 @@ def _reset_dvi_solver_data(
 
 
 @wp.kernel
+def _scale_dvi_tangential_warmstart(
+    model_info_total_cts_offset: wp.array[int32],
+    data_info_contact_cts_group_offset: wp.array[int32],
+    contact_model_num_contacts: wp.array[int32],
+    contact_wid: wp.array[int32],
+    contact_cid: wp.array[int32],
+    solver_config: wp.array[DVIConfigStruct],
+    solution_lambdas: wp.array[float32],
+):
+    """Decay copied tangential warmstarts while retaining normal warmstarts."""
+    cid = wp.tid()
+    if cid >= contact_model_num_contacts[0]:
+        return
+
+    wid = contact_wid[cid]
+    vio_k = model_info_total_cts_offset[wid] + data_info_contact_cts_group_offset[wid] + 3 * contact_cid[cid]
+    cfg = solver_config[wid]
+    scale = cfg.tangential_warmstart_scale
+    solution_lambdas[vio_k] *= scale
+    solution_lambdas[vio_k + 1] *= scale
+
+
+@wp.kernel
 def _reset_dvi_status(
     # Outputs:
     solver_status: wp.array[DVIStatus],
@@ -114,7 +146,12 @@ def _copy_bilateral_block(
     wid, tid = wp.tid()
 
     njc = problem_njc[wid]
-    if njc == 0 or tid >= njc * njc:
+    if njc == 0:
+        if tid == 0:
+            bilateral_D[bilateral_mio[wid]] = float32(1.0)
+            bilateral_P[bilateral_vio[wid]] = float32(1.0)
+        return
+    if tid >= njc * njc:
         return
 
     ncts = problem_dim[wid]
@@ -135,69 +172,6 @@ def _copy_bilateral_block(
         val += float32(7.0e-7)
         bilateral_P[bvio + row] = p_row
     bilateral_D[bmio + njc * row + col] = val
-
-
-@wp.kernel
-def _compute_dvi_contact_block_inverse(
-    # Inputs:
-    problem_dim: wp.array[int32],
-    problem_mio: wp.array[int32],
-    problem_nc: wp.array[int32],
-    problem_ccgo: wp.array[int32],
-    problem_cio: wp.array[int32],
-    problem_D: wp.array[float32],
-    solver_config: wp.array[DVIConfigStruct],
-    # Outputs:
-    contact_block_inv: wp.array[mat33f],
-):
-    wid, cid = wp.tid()
-
-    nc = problem_nc[wid]
-    if cid >= nc:
-        return
-
-    ncts = problem_dim[wid]
-    mio = problem_mio[wid]
-    ccgo = problem_ccgo[wid]
-    cio = problem_cio[wid]
-    ccio = ccgo + int32(3) * cid
-    cfg = solver_config[wid]
-    D_inv = mat33f(0.0)
-
-    if not cfg.contact_block_preconditioner:
-        contact_block_inv[cio + cid] = D_inv
-        return
-
-    r0 = mio + ncts * (ccio + 0)
-    r1 = mio + ncts * (ccio + 1)
-    r2 = mio + ncts * (ccio + 2)
-
-    d00 = problem_D[r0 + ccio + 0]
-    d01 = float32(0.5) * (problem_D[r0 + ccio + 1] + problem_D[r1 + ccio + 0])
-    d02 = float32(0.5) * (problem_D[r0 + ccio + 2] + problem_D[r2 + ccio + 0])
-    d11 = problem_D[r1 + ccio + 1]
-    d12 = float32(0.5) * (problem_D[r1 + ccio + 2] + problem_D[r2 + ccio + 1])
-    d22 = problem_D[r2 + ccio + 2]
-
-    diag_max = wp.max(wp.max(wp.abs(d00), wp.abs(d11)), wp.abs(d22))
-    if diag_max > FLOAT32_EPS:
-        D_reg = mat33f(
-            d00 + cfg.regularization,
-            d01,
-            d02,
-            d01,
-            d11 + cfg.regularization,
-            d12,
-            d02,
-            d12,
-            d22 + cfg.regularization,
-        )
-        det = wp.determinant(D_reg)
-        det_min = FLOAT32_EPS * diag_max * diag_max * diag_max
-        if det > det_min:
-            D_inv = wp.inverse(D_reg)
-
-    contact_block_inv[cio + cid] = D_inv
 
 
 @wp.kernel
@@ -256,33 +230,61 @@ def _scatter_bilateral_solution(
     solution_lambdas[problem_vio[wid] + row] = bilateral_P[bvio + row] * bilateral_solution[bvio + row]
 
 
+@wp.func_native(
+    """
+#if defined(__CUDA_ARCH__)
+    float r = value;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        r = fmaxf(r, __shfl_xor_sync(0xffffffffu, r, offset, 32));
+    return r;
+#else
+    return value;
+#endif
+    """
+)
+def _warp_max_32(value: float32) -> float32: ...
+
+
 @wp.kernel
 def _compute_dvi_status_residuals(
     # Inputs:
     problem_dim: wp.array[int32],
     problem_vio: wp.array[int32],
     problem_njc: wp.array[int32],
+    problem_nbc: wp.array[int32],
     problem_nl: wp.array[int32],
     problem_nc: wp.array[int32],
+    problem_bcgo: wp.array[int32],
     problem_lcgo: wp.array[int32],
     problem_ccgo: wp.array[int32],
+    problem_bcio: wp.array[int32],
     problem_cio: wp.array[int32],
     problem_mu: wp.array[float32],
+    problem_bound_lower: wp.array[float32],
+    problem_bound_upper: wp.array[float32],
     solver_config: wp.array[DVIConfigStruct],
     state_v_aug: wp.array[float32],
     solution_lambdas: wp.array[float32],
     # Outputs:
     solver_status: wp.array[DVIStatus],
+    workers_per_world: int32,
 ):
-    wid = wp.tid()
+    """Compute terminal maxima with one thread or one 32-thread warp per world."""
+    tid = wp.tid()
+    wid = tid / workers_per_world
+    lane = tid % workers_per_world
 
     ncts = problem_dim[wid]
     vio = problem_vio[wid]
     njc = problem_njc[wid]
+    nbc = problem_nbc[wid]
     nl = problem_nl[wid]
     nc = problem_nc[wid]
+    bcgo = problem_bcgo[wid]
     lcgo = problem_lcgo[wid]
     ccgo = problem_ccgo[wid]
+    bcio = problem_bcio[wid]
     cio = problem_cio[wid]
     cfg = solver_config[wid]
 
@@ -298,12 +300,24 @@ def _compute_dvi_status_residuals(
     r_c = float32(0.0)
 
     # Bilateral rows require v_aug = 0.
-    for jid in range(njc):
+    for jid in range(lane, njc, workers_per_world):
         v_j = state_v_aug[vio + jid]
         r_b = wp.max(r_b, wp.abs(v_j))
 
+    # Bounded-multiplier rows require lambda in the box `[lower, upper]` and directional
+    # complementarity with the face selected by the sign of v_aug. There is no dual
+    # condition, since v_aug is free to take either sign on a box row.
+    for bid in range(lane, nbc, workers_per_world):
+        bcio_v = vio + bcgo + bid
+        lambda_b = solution_lambdas[bcio_v]
+        v_b = state_v_aug[bcio_v]
+        lower = problem_bound_lower[bcio + bid]
+        upper = problem_bound_upper[bcio + bid]
+        r_p = wp.max(r_p, wp.abs(lambda_b - wp.clamp(lambda_b, lower, upper)))
+        r_c = wp.max(r_c, wp.abs(compute_box_complementarity_residual(lambda_b, v_b, lower, upper)))
+
     # Limits require lambda and v_aug in R+ with lambda * v_aug = 0.
-    for lid in range(nl):
+    for lid in range(lane, nl, workers_per_world):
         lcio = vio + lcgo + lid
         lambda_l = solution_lambdas[lcio]
         v_l = state_v_aug[lcio]
@@ -312,7 +326,7 @@ def _compute_dvi_status_residuals(
         r_c = wp.max(r_c, wp.abs(lambda_l * v_l))
 
     # Contacts require lambda in K_mu, v_aug in its dual cone, and orthogonality.
-    for cid in range(nc):
+    for cid in range(lane, nc, workers_per_world):
         ccio = vio + ccgo + 3 * cid
         mu_c = problem_mu[cio + cid]
         lambda_c = vec3f(solution_lambdas[ccio], solution_lambdas[ccio + 1], solution_lambdas[ccio + 2])
@@ -323,8 +337,16 @@ def _compute_dvi_status_residuals(
         r_d = wp.max(r_d, wp.max(wp.abs(v_c - v_proj)))
         r_c = wp.max(r_c, wp.abs(wp.dot(lambda_c, v_c)))
 
-    # Thus r_p and r_d are infinity-norm cone-projection distances, while r_c
-    # is the maximum absolute impulse-velocity inner product.
+    if workers_per_world == int32(32):
+        r_b = _warp_max_32(r_b)
+        r_p = _warp_max_32(r_p)
+        r_d = _warp_max_32(r_d)
+        r_c = _warp_max_32(r_c)
+    if lane != int32(0):
+        return
+
+    # Thus r_p and r_d are infinity-norm box- and cone-projection distances, while r_c
+    # is the maximum absolute impulse-velocity product.
     status.r_b = r_b
     status.r_p = r_p
     status.r_d = wp.max(r_d, r_b)
@@ -332,156 +354,6 @@ def _compute_dvi_status_residuals(
     status.converged = int32(0)
     if ncts == 0 or (r_b <= cfg.tolerance and r_p <= cfg.tolerance and r_d <= cfg.tolerance and r_c <= cfg.tolerance):
         status.converged = int32(1)
-    solver_status[wid] = status
-
-
-@wp.kernel
-def _solve_dvi_pgs(
-    # Inputs:
-    problem_dim: wp.array[int32],
-    problem_mio: wp.array[int32],
-    problem_vio: wp.array[int32],
-    problem_njc: wp.array[int32],
-    problem_nl: wp.array[int32],
-    problem_nc: wp.array[int32],
-    problem_lcgo: wp.array[int32],
-    problem_ccgo: wp.array[int32],
-    problem_cio: wp.array[int32],
-    problem_mu: wp.array[float32],
-    problem_D: wp.array[float32],
-    problem_v_f: wp.array[float32],
-    contact_block_inv: wp.array[mat33f],
-    solver_config: wp.array[DVIConfigStruct],
-    # Outputs:
-    solver_status: wp.array[DVIStatus],
-    solution_lambdas: wp.array[float32],
-):
-    wid = wp.tid()
-
-    ncts = problem_dim[wid]
-    vio = problem_vio[wid]
-    mio = problem_mio[wid]
-    njc = problem_njc[wid]
-    nl = problem_nl[wid]
-    nc = problem_nc[wid]
-    lcgo = problem_lcgo[wid]
-    ccgo = problem_ccgo[wid]
-    cio = problem_cio[wid]
-    cfg = solver_config[wid]
-
-    status = DVIStatus()
-    status.converged = int32(0)
-    status.iterations = int32(0)
-    status.r_p = float32(0.0)
-    status.r_d = float32(0.0)
-    status.r_c = float32(0.0)
-    status.r_b = float32(0.0)
-
-    if ncts == 0:
-        status.converged = int32(1)
-        solver_status[wid] = status
-        return
-
-    # This fallback stops on the unnormalized infinity norm of the impulse
-    # update. The residual fields below are provisional; solve() later replaces
-    # them with terminal cone-feasibility and complementarity diagnostics.
-    done = int32(0)
-    for iteration in range(cfg.max_iterations):
-        if done == 0:
-            max_step = float32(0.0)
-            max_velocity = float32(0.0)
-            max_complementarity = float32(0.0)
-
-            # Equality constraints use scalar Gauss-Seidel updates. This keeps the
-            # solve on Kamino's Delassus system while avoiding a separate subsystem.
-            for i in range(njc):
-                v_i = _compute_row_velocity(ncts, mio, vio, i, problem_D, problem_v_f, solution_lambdas)
-                D_ii = wp.abs(problem_D[mio + ncts * i + i]) + cfg.regularization + FLOAT32_EPS
-                # Bilateral projection is the identity: lambda += -omega * B * v.
-                delta = -cfg.omega * v_i / D_ii
-                solution_lambdas[vio + i] += delta
-                max_step = wp.max(max_step, wp.abs(delta))
-                max_velocity = wp.max(max_velocity, wp.abs(v_i))
-
-            for li in range(nl):
-                i = lcgo + li
-                v_i = _compute_row_velocity(ncts, mio, vio, i, problem_D, problem_v_f, solution_lambdas)
-                D_ii_raw = wp.abs(problem_D[mio + ncts * i + i])
-                lambda_limit_old = solution_lambdas[vio + i]
-                lambda_limit_new = lambda_limit_old
-                if D_ii_raw > FLOAT32_EPS:
-                    # Project lambda - omega * B * v onto the nonnegative ray.
-                    lambda_limit_new = wp.max(0.0, lambda_limit_old - cfg.omega * v_i / (D_ii_raw + cfg.regularization))
-                solution_lambdas[vio + i] = lambda_limit_new
-                max_step = wp.max(max_step, wp.abs(lambda_limit_new - lambda_limit_old))
-                max_velocity = wp.max(max_velocity, wp.abs(wp.min(v_i, 0.0)))
-                max_complementarity = wp.max(max_complementarity, wp.abs(lambda_limit_new * v_i))
-
-            for cid in range(nc):
-                ccio = ccgo + 3 * cid
-                v_c = _contact_velocity_aug(
-                    ncts,
-                    mio,
-                    vio,
-                    ccgo,
-                    cio,
-                    cid,
-                    problem_D,
-                    problem_v_f,
-                    solution_lambdas,
-                    problem_mu,
-                )
-                D_00 = wp.abs(problem_D[mio + ncts * (ccio + 0) + (ccio + 0)])
-                D_11 = wp.abs(problem_D[mio + ncts * (ccio + 1) + (ccio + 1)])
-                D_22 = wp.abs(problem_D[mio + ncts * (ccio + 2) + (ccio + 2)])
-                lambda_contact_old = vec3f(
-                    solution_lambdas[vio + ccio + 0],
-                    solution_lambdas[vio + ccio + 1],
-                    solution_lambdas[vio + ccio + 2],
-                )
-                # Project the three-row impulse update onto K_mu. The block
-                # preconditioner retains normal-tangential coupling in D_cc.
-                if cfg.contact_block_preconditioner:
-                    lambda_contact_projected = _project_contact_block_update(
-                        lambda_contact_old,
-                        v_c,
-                        vec3f(D_00, D_11, D_22),
-                        contact_block_inv[cio + cid],
-                        cfg.regularization,
-                        cfg.contact_jacobi_omega,
-                        problem_mu[cio + cid],
-                    )
-                    lambda_contact_new = lambda_contact_old + cfg.contact_jacobi_relaxation * (
-                        lambda_contact_projected - lambda_contact_old
-                    )
-                else:
-                    lambda_contact_new = _project_contact_diagonal_update(
-                        lambda_contact_old,
-                        v_c,
-                        _contact_trace_preconditioner(vec3f(D_00, D_11, D_22)),
-                        cfg.regularization,
-                        cfg.omega,
-                        problem_mu[cio + cid],
-                    )
-                solution_lambdas[vio + ccio + 0] = lambda_contact_new.x
-                solution_lambdas[vio + ccio + 1] = lambda_contact_new.y
-                solution_lambdas[vio + ccio + 2] = lambda_contact_new.z
-                lambda_delta = lambda_contact_new - lambda_contact_old
-                max_step = wp.max(max_step, wp.max(wp.abs(lambda_delta)))
-                max_velocity = wp.max(max_velocity, wp.max(wp.abs(v_c)))
-                max_complementarity = wp.max(max_complementarity, wp.abs(wp.dot(lambda_contact_new, v_c)))
-
-            status.iterations = iteration + int32(1)
-            status.r_p = max_step
-            status.r_d = max_velocity
-            status.r_c = max_complementarity
-            if max_step <= cfg.tolerance:
-                status.converged = int32(1)
-                done = int32(1)
-
-    if done == 0:
-        status.converged = int32(0)
-
     solver_status[wid] = status
 
 
@@ -496,7 +368,7 @@ def _initialize_dvi_status(
     cfg = solver_config[wid]
     status = DVIStatus()
     status.converged = int32(0)
-    status.iterations = cfg.contact_iterations
+    status.iterations = cfg.inequality_sweeps_per_iteration
     status.r_p = float32(0.0)
     status.r_d = float32(0.0)
     status.r_c = float32(0.0)
@@ -507,19 +379,22 @@ def _initialize_dvi_status(
 @wp.kernel
 def _set_dvi_direct_status_iterations(
     # Inputs:
+    problem_nbc: wp.array[int32],
     problem_nl: wp.array[int32],
     problem_nc: wp.array[int32],
     solver_config: wp.array[DVIConfigStruct],
+    preserve_reported: wp.bool,
     # Outputs:
     solver_status: wp.array[DVIStatus],
 ):
     wid = wp.tid()
     cfg = solver_config[wid]
     status = solver_status[wid]
-    if problem_nl[wid] == int32(0) and problem_nc[wid] == int32(0):
-        status.iterations = int32(1)
-    else:
-        status.iterations = cfg.block_iterations * cfg.contact_iterations
+    if not preserve_reported or status.iterations <= int32(0):
+        if problem_nbc[wid] == int32(0) and problem_nl[wid] == int32(0) and problem_nc[wid] == int32(0):
+            status.iterations = int32(1)
+        else:
+            status.iterations = cfg.max_alternating_iterations * cfg.inequality_sweeps_per_iteration
     solver_status[wid] = status
 
 
@@ -527,93 +402,25 @@ def _set_dvi_direct_status_iterations(
 def _set_dvi_bilateral_active_dim(
     # Inputs:
     problem_njc: wp.array[int32],
+    problem_nbc: wp.array[int32],
     problem_nl: wp.array[int32],
     problem_nc: wp.array[int32],
+    block_iteration: int32,
+    solver_config: wp.array[DVIConfigStruct],
     # Outputs:
     bilateral_active_dim: wp.array[int32],
 ):
     wid = wp.tid()
     active_dim = int32(0)
-    if problem_nl[wid] > int32(0) or problem_nc[wid] > int32(0):
-        active_dim = problem_njc[wid]
+    if problem_nbc[wid] > int32(0) or problem_nl[wid] > int32(0) or problem_nc[wid] > int32(0):
+        if block_iteration < int32(0):
+            active_dim = problem_njc[wid]
+        else:
+            next_block = block_iteration + int32(1)
+            cfg = solver_config[wid]
+            if next_block < cfg.max_alternating_iterations and next_block % cfg.bilateral_solve_interval == int32(0):
+                active_dim = problem_njc[wid]
     bilateral_active_dim[wid] = active_dim
-
-
-@wp.kernel
-def _solve_dvi_limits_pgs(
-    # Inputs:
-    problem_dim: wp.array[int32],
-    problem_mio: wp.array[int32],
-    problem_vio: wp.array[int32],
-    problem_nl: wp.array[int32],
-    problem_lcgo: wp.array[int32],
-    problem_D: wp.array[float32],
-    problem_v_f: wp.array[float32],
-    block_iteration: int32,
-    solver_config: wp.array[DVIConfigStruct],
-    # Outputs:
-    solver_status: wp.array[DVIStatus],
-    solution_lambdas: wp.array[float32],
-):
-    wid = wp.tid()
-
-    ncts = problem_dim[wid]
-    vio = problem_vio[wid]
-    mio = problem_mio[wid]
-    nl = problem_nl[wid]
-    lcgo = problem_lcgo[wid]
-    cfg = solver_config[wid]
-
-    if block_iteration >= cfg.block_iterations:
-        return
-
-    status = DVIStatus()
-    status.converged = int32(0)
-    status.iterations = cfg.contact_iterations
-    status.r_p = float32(0.0)
-    status.r_d = float32(0.0)
-    status.r_c = float32(0.0)
-    status.r_b = float32(0.0)
-
-    if ncts == 0 or nl == 0:
-        status.converged = int32(1)
-        solver_status[wid] = status
-        return
-
-    # Limit sweeps use the same iterate-change stopping measure as the full
-    # dense fallback. Terminal DVI residuals are evaluated after all blocks.
-    done = int32(0)
-    for iteration in range(cfg.contact_iterations):
-        if done == 0:
-            max_step = float32(0.0)
-            max_velocity = float32(0.0)
-            max_complementarity = float32(0.0)
-
-            for li in range(nl):
-                i = lcgo + li
-                v_i = _compute_row_velocity(ncts, mio, vio, i, problem_D, problem_v_f, solution_lambdas)
-                D_ii_raw = wp.abs(problem_D[mio + ncts * i + i])
-                lambda_limit_old = solution_lambdas[vio + i]
-                lambda_limit_new = lambda_limit_old
-                if D_ii_raw > FLOAT32_EPS:
-                    lambda_limit_new = wp.max(0.0, lambda_limit_old - cfg.omega * v_i / (D_ii_raw + cfg.regularization))
-                solution_lambdas[vio + i] = lambda_limit_new
-                max_step = wp.max(max_step, wp.abs(lambda_limit_new - lambda_limit_old))
-                max_velocity = wp.max(max_velocity, wp.abs(wp.min(v_i, 0.0)))
-                max_complementarity = wp.max(max_complementarity, wp.abs(lambda_limit_new * v_i))
-
-            status.iterations = iteration + int32(1)
-            status.r_p = max_step
-            status.r_d = max_velocity
-            status.r_c = max_complementarity
-            if max_step <= cfg.tolerance:
-                status.converged = int32(1)
-                done = int32(1)
-
-    if done == 0:
-        status.converged = int32(0)
-
-    solver_status[wid] = status
 
 
 @wp.func_native("""
@@ -624,331 +431,711 @@ __syncthreads();
 def _sync_threads(): ...
 
 
-@wp.func
-def _contacts_share_dynamic_body(a: wp.vec2i, b: wp.vec2i) -> bool:
-    a0 = a[0]
-    a1 = a[1]
-    b0 = b[0]
-    b1 = b[1]
-    share = bool(False)
-    if a0 >= int32(0):
-        if a0 == b0 or a0 == b1:
-            share = bool(True)
-    if a1 >= int32(0):
-        if a1 == b0 or a1 == b1:
-            share = bool(True)
-    return share
+@wp.func_native("""
+#if defined(__CUDA_ARCH__)
+__syncwarp(0xffffffffu);
+#endif
+""")
+def _sync_warp(): ...
 
 
 @wp.kernel
-def _color_dvi_contacts(
-    # Inputs:
-    problem_nc: wp.array[int32],
-    problem_cio: wp.array[int32],
-    contact_bid_AB: wp.array[wp.vec2i],
-    # Outputs:
-    contact_colors: wp.array[int32],
-    contact_num_colors: wp.array[int32],
-):
-    wid = wp.tid()
-
-    nc = problem_nc[wid]
-    cio = problem_cio[wid]
-    if nc == 0:
-        contact_num_colors[wid] = int32(0)
-        return
-
-    # Contacts in one color share no dynamic body, so their Delassus
-    # cross-blocks vanish and their Gauss-Seidel updates may run concurrently.
-    num_colors = int32(0)
-    for cid in range(nc):
-        pair = contact_bid_AB[cio + cid]
-        color = int32(0)
-        found = int32(0)
-        while found == int32(0) and color < nc:
-            conflict = int32(0)
-            prev = int32(0)
-            while prev < cid:
-                if contact_colors[cio + prev] == color:
-                    prev_pair = contact_bid_AB[cio + prev]
-                    if _contacts_share_dynamic_body(pair, prev_pair):
-                        conflict = int32(1)
-                prev = prev + int32(1)
-
-            if conflict == int32(0):
-                found = int32(1)
-            else:
-                color = color + int32(1)
-
-        contact_colors[cio + cid] = color
-        num_colors = wp.max(num_colors, color + int32(1))
-
-    contact_num_colors[wid] = num_colors
-
-
-@wp.kernel
-def _solve_dvi_contacts_colored_gs(
-    # Inputs:
+def _solve_bilateral_contact_response(
     problem_dim: wp.array[int32],
     problem_mio: wp.array[int32],
-    problem_vio: wp.array[int32],
-    problem_nc: wp.array[int32],
-    problem_ccgo: wp.array[int32],
-    problem_cio: wp.array[int32],
-    problem_mu: wp.array[float32],
+    problem_njc: wp.array[int32],
+    bilateral_mio: wp.array[int32],
+    bilateral_vio: wp.array[int32],
+    bilateral_P: wp.array[float32],
+    projected_mio: wp.array[int32],
     problem_D: wp.array[float32],
-    block_iteration: int32,
-    contact_block_inv: wp.array[mat33f],
-    contact_colors: wp.array[int32],
-    contact_num_colors: wp.array[int32],
-    solver_config: wp.array[DVIConfigStruct],
-    # Outputs:
-    state_v_aug: wp.array[float32],
-    solution_lambdas: wp.array[float32],
+    bilateral_L: wp.array[float32],
+    bilateral_permutation: wp.array[int32],
+    use_permutation: bool,
+    unilateral_begin: int32,
+    projected_D: wp.array[float32],
 ):
+    wid, unilateral_local = wp.tid()
+    ncts = problem_dim[wid]
+    njc = problem_njc[wid]
+    unilateral = njc + unilateral_begin + unilateral_local
+    if njc == int32(0) or unilateral >= ncts:
+        return
+
+    source = problem_mio[wid]
+    factor = bilateral_mio[wid]
+    bvio = bilateral_vio[wid]
+    target = projected_mio[wid]
+
+    for row in range(njc):
+        original_row = row
+        if use_permutation:
+            original_row = bilateral_permutation[bvio + row]
+        value = bilateral_P[bvio + original_row] * problem_D[source + ncts * original_row + unilateral]
+        for k in range(row):
+            value -= bilateral_L[factor + njc * row + k] * projected_D[target + ncts * k + unilateral]
+        projected_D[target + ncts * row + unilateral] = value / bilateral_L[factor + njc * row + row]
+
+    for reverse_row in range(njc):
+        row = njc - int32(1) - reverse_row
+        value = projected_D[target + ncts * row + unilateral]
+        for k in range(row + int32(1), njc):
+            value -= bilateral_L[factor + njc * k + row] * projected_D[target + ncts * k + unilateral]
+        projected_D[target + ncts * row + unilateral] = value / bilateral_L[factor + njc * row + row]
+
+
+@wp.kernel
+def _assemble_bilateral_contact_response(
+    problem_dim: wp.array[int32],
+    problem_mio: wp.array[int32],
+    problem_njc: wp.array[int32],
+    bilateral_vio: wp.array[int32],
+    bilateral_P: wp.array[float32],
+    projected_mio: wp.array[int32],
+    problem_D: wp.array[float32],
+    bilateral_permutation: wp.array[int32],
+    use_permutation: bool,
+    projected_D: wp.array[float32],
+):
+    wid, unilateral_row_local, unilateral_column_local = wp.tid()
+    ncts = problem_dim[wid]
+    njc = problem_njc[wid]
+    unilateral_row = njc + unilateral_row_local
+    unilateral_column = njc + unilateral_column_local
+    if unilateral_row >= ncts or unilateral_column >= ncts:
+        return
+
+    source = problem_mio[wid]
+    bvio = bilateral_vio[wid]
+    target = projected_mio[wid]
+    value = problem_D[source + ncts * unilateral_row + unilateral_column]
+    for row in range(njc):
+        original_row = row
+        if use_permutation:
+            original_row = bilateral_permutation[bvio + row]
+        response = bilateral_P[bvio + original_row] * projected_D[target + ncts * row + unilateral_column]
+        value -= problem_D[source + ncts * unilateral_row + original_row] * response
+    projected_D[target + ncts * unilateral_row + unilateral_column] = value
+
+
+@wp.func_native(
+    """
+#if defined(__CUDA_ARCH__)
+    float r = value;
+    #pragma unroll
+    for (int offset = 8; offset > 0; offset >>= 1)
+        r += __shfl_xor_sync(0xffffffffu, r, offset, 16);
+    return r;
+#else
+    return value;
+#endif
+    """
+)
+def _subgroup_sum_16(value: float32) -> float32: ...
+
+
+@wp.func_native(
+    """
+#if defined(__CUDA_ARCH__)
+    int r = value;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        r = min(r, __shfl_xor_sync(0xffffffffu, r, offset));
+    return r;
+#else
+    return value;
+#endif
+    """
+)
+def _warp_min_32(value: int32) -> int32: ...
+
+
+@wp.func
+def _compact_schur_fits(njc: int32, nu: int32, stride: int32) -> bool:
+    # Avoid squaring nu: the allocated response size is already int32-safe.
+    return nu <= (njc * stride) / wp.max(nu, int32(1))
+
+
+@wp.kernel
+def _find_bilateral_factor_row_start(
+    njc: wp.array[int32],
+    mio: wp.array[int32],
+    vio: wp.array[int32],
+    factor: wp.array[float32],
+    row_start: wp.array[int32],
+):
+    """Skip exact leading zeros while preserving the response reduction order."""
+    wid, row = wp.tid()
+    n = njc[wid]
+    if row >= n:
+        return
+    first = int32(0)
+    offset = mio[wid]
+    while first < row and factor[offset + n * row + first] == float32(0.0):
+        first += int32(1)
+    row_start[vio[wid] + row] = first / int32(16) * int32(16)
+
+
+@wp.kernel
+def _find_bilateral_factor_row_start_rcm(
+    njc: wp.array[int32],
+    mio: wp.array[int32],
+    vio: wp.array[int32],
+    factor: wp.array[float32],
+    row_start: wp.array[int32],
+    tpo: wp.array[int32],
+    pattern: wp.array[int32],
+    block_size: int32,
+):
+    """Use the filled RCM tile mask to accelerate the exact leading-zero scan."""
+    wid, row = wp.tid()
+    n = njc[wid]
+    if row >= n:
+        return
+    tiles = (n + block_size - 1) // block_size
+    tile_offset = tpo[wid] + (row // block_size) * tiles
+    offset = mio[wid]
+    first = int32(0)
+    for tile in range((row + block_size - 1) // block_size):
+        end = wp.min(row, (tile + 1) * block_size)
+        if pattern[tile_offset + tile] == 0:
+            # Factorization clears skipped tiles, including when sparsity shrinks.
+            first = end
+        else:
+            # Marked tiles can contain numerical zeros: preserve the exact prefix.
+            while first < end and factor[offset + n * row + first] == float32(0.0):
+                first += 1
+            if first < end:
+                break
+    # Preserve the dense scan's 16-lane response reduction alignment.
+    row_start[vio[wid] + row] = first // 16 * 16
+
+
+@wp.kernel
+def _solve_bilateral_unilateral_response_compact(
+    problem_dim: wp.array[int32],
+    problem_njc: wp.array[int32],
+    bilateral_mio: wp.array[int32],
+    bilateral_vio: wp.array[int32],
+    bilateral_P: wp.array[float32],
+    bilateral_L: wp.array[float32],
+    bilateral_permutation: wp.array[int32],
+    response_mio: wp.array[int32],
+    response_stride: wp.array[int32],
+    coupling: wp.array[float32],
+    response: wp.array[float32],
+    factor_row_start: wp.array[int32],
+):
+    """Whiten permuted response columns independently for large compact batches."""
+    wid, unilateral = wp.tid()
+    njc = problem_njc[wid]
+    nu = problem_dim[wid] - njc
+    if unilateral >= nu or not _compact_schur_fits(njc, nu, response_stride[wid]):
+        return
+    offset = response_mio[wid]
+    for row in range(njc):
+        original_row = bilateral_permutation[bilateral_vio[wid] + row]
+        value = bilateral_P[bilateral_vio[wid] + original_row] * coupling[offset + original_row * nu + unilateral]
+        for k in range(factor_row_start[bilateral_vio[wid] + row], row):
+            value -= bilateral_L[bilateral_mio[wid] + njc * row + k] * response[offset + k * nu + unilateral]
+        response[offset + row * nu + unilateral] = value / bilateral_L[bilateral_mio[wid] + njc * row + row]
+
+
+@wp.kernel
+def _solve_bilateral_unilateral_response_cooperative(
+    problem_dim: wp.array[int32],
+    problem_njc: wp.array[int32],
+    bilateral_mio: wp.array[int32],
+    bilateral_vio: wp.array[int32],
+    bilateral_P: wp.array[float32],
+    bilateral_L: wp.array[float32],
+    bilateral_permutation: wp.array[int32],
+    use_permutation: bool,
+    response_mio: wp.array[int32],
+    response_stride: wp.array[int32],
+    coupling: wp.array[float32],
+    response_factor: wp.array[float32],
+    response: wp.array[float32],
+    first_unilateral: int32,
+    tasks_per_world: int32,
+    use_forward_schur: bool,
+    factor_row_start: wp.array[int32],
+    skip_compact: bool,
+):
+    """Solve response columns, or whiten them for compact Schur construction."""
+    # Keep whitening scratch unilateral-major, but output row-major for coalesced Gram loads.
+    # The fallback response uses original_row * unilateral_stride + unilateral.
+    tid = wp.tid()
+    lane = tid % int32(32)
+    task = tid / int32(32)
+    wid = task / tasks_per_world
+    task_in_world = task - wid * tasks_per_world
+    local_lane = lane % int32(16)
+    njc = problem_njc[wid]
+    nu = problem_dim[wid] - njc
+    factor = bilateral_mio[wid]
+    bvio = bilateral_vio[wid]
+    offset = response_mio[wid]
+    unilateral_stride = response_stride[wid]
+    compact_fits = use_forward_schur and _compact_schur_fits(njc, nu, unilateral_stride)
+    if skip_compact and compact_fits:
+        return
+    # Compact worlds store the coupling densely (see the coupling assembly kernel).
+    coupling_stride = wp.where(compact_fits, nu, unilateral_stride)
+    first_pair = (first_unilateral + int32(1)) / int32(2)
+    pair_count = (nu + int32(1)) / int32(2)
+    for unilateral_pair in range(first_pair + task_in_world, pair_count, tasks_per_world):
+        unilateral = int32(2) * unilateral_pair + lane / int32(16)
+        active = unilateral < nu
+        first_row = njc
+        if active:
+            for row in range(local_lane, njc, int32(16)):
+                original_row = row
+                if use_permutation:
+                    original_row = bilateral_permutation[bvio + row]
+                if coupling[offset + original_row * coupling_stride + unilateral] != float32(0.0):
+                    first_row = wp.min(first_row, row)
+        # Both response columns share warp barriers, so use their common prefix.
+        first_row = _warp_min_32(first_row)
+        if active:
+            for row in range(local_lane, first_row, int32(16)):
+                response_factor[offset + unilateral * njc + row] = float32(0.0)
+        _sync_warp()
+        for row in range(first_row, njc):
+            partial = float32(0.0)
+            if active:
+                for k in range(factor_row_start[bvio + row] + local_lane, row, int32(16)):
+                    partial += bilateral_L[factor + njc * row + k] * response_factor[offset + unilateral * njc + k]
+            total = _subgroup_sum_16(partial)
+            if local_lane == int32(0) and active:
+                original_row = row
+                if use_permutation:
+                    original_row = bilateral_permutation[bvio + row]
+                value = (
+                    bilateral_P[bvio + original_row] * coupling[offset + original_row * coupling_stride + unilateral]
+                )
+                response_factor[offset + unilateral * njc + row] = (value - total) / bilateral_L[
+                    factor + njc * row + row
+                ]
+            _sync_warp()
+        backward_rows = njc
+        if use_forward_schur and _compact_schur_fits(njc, nu, unilateral_stride):
+            # C.T A^-1 C = Y.T Y with Y = L^-1 P C; backward solves are unnecessary.
+            backward_rows = int32(0)
+        for reverse_row in range(backward_rows):
+            row = njc - int32(1) - reverse_row
+            partial = float32(0.0)
+            if active:
+                for k in range(row + int32(1) + local_lane, njc, int32(16)):
+                    partial += bilateral_L[factor + njc * k + row] * response_factor[offset + unilateral * njc + k]
+            total = _subgroup_sum_16(partial)
+            if local_lane == int32(0) and active:
+                value = response_factor[offset + unilateral * njc + row]
+                response_factor[offset + unilateral * njc + row] = (value - total) / bilateral_L[
+                    factor + njc * row + row
+                ]
+            _sync_warp()
+        if active:
+            for row in range(local_lane, njc, int32(16)):
+                original_row = row
+                if use_permutation:
+                    original_row = bilateral_permutation[bvio + row]
+                if use_forward_schur and _compact_schur_fits(njc, nu, unilateral_stride):
+                    response[offset + row * nu + unilateral] = response_factor[offset + unilateral * njc + row]
+                else:
+                    response[offset + original_row * unilateral_stride + unilateral] = (
+                        bilateral_P[bvio + original_row] * response_factor[offset + unilateral * njc + row]
+                    )
+
+
+@wp.kernel
+def _solve_bilateral_unilateral_response(
+    problem_dim: wp.array[int32],
+    problem_njc: wp.array[int32],
+    bilateral_mio: wp.array[int32],
+    bilateral_vio: wp.array[int32],
+    bilateral_P: wp.array[float32],
+    bilateral_L: wp.array[float32],
+    bilateral_permutation: wp.array[int32],
+    use_permutation: bool,
+    response_mio: wp.array[int32],
+    response_stride: wp.array[int32],
+    coupling: wp.array[float32],
+    response_factor: wp.array[float32],
+    response: wp.array[float32],
+):
+    # response_factor is row-major here; response always uses
+    # original_row * unilateral_stride + unilateral.
     tid = wp.tid()
     threads_per_world = int32(wp.block_dim())
     lane = tid % threads_per_world
     wid = tid / threads_per_world
+    njc = problem_njc[wid]
+    nu = problem_dim[wid] - njc
+    factor = bilateral_mio[wid]
+    bvio = bilateral_vio[wid]
+    offset = response_mio[wid]
+    unilateral_stride = response_stride[wid]
+    for unilateral in range(lane, nu, threads_per_world):
+        for row in range(njc):
+            original_row = row
+            if use_permutation:
+                original_row = bilateral_permutation[bvio + row]
+            value = bilateral_P[bvio + original_row] * coupling[offset + original_row * unilateral_stride + unilateral]
+            for k in range(row):
+                value -= (
+                    bilateral_L[factor + njc * row + k] * response_factor[offset + k * unilateral_stride + unilateral]
+                )
+            response_factor[offset + row * unilateral_stride + unilateral] = (
+                value / bilateral_L[factor + njc * row + row]
+            )
 
-    nc = problem_nc[wid]
-    cio = problem_cio[wid]
-    if nc == 0:
-        return
+        for reverse_row in range(njc):
+            row = njc - int32(1) - reverse_row
+            value = response_factor[offset + row * unilateral_stride + unilateral]
+            for k in range(row + int32(1), njc):
+                value -= (
+                    bilateral_L[factor + njc * k + row] * response_factor[offset + k * unilateral_stride + unilateral]
+                )
+            response_factor[offset + row * unilateral_stride + unilateral] = (
+                value / bilateral_L[factor + njc * row + row]
+            )
 
-    ncts = problem_dim[wid]
-    vio = problem_vio[wid]
-    mio = problem_mio[wid]
-    ccgo = problem_ccgo[wid]
-    cfg = solver_config[wid]
-    if block_iteration >= cfg.block_iterations:
-        return
-
-    num_colors = contact_num_colors[wid]
-    # Colored contact updates execute a fixed number of sweeps. Convergence is
-    # evaluated only after the complete direct-bilateral block schedule.
-    iteration = int32(0)
-    while iteration < cfg.contact_iterations:
-        color = int32(0)
-        while color < num_colors:
-            cid = lane
-            while cid < nc:
-                if contact_colors[cio + cid] == color:
-                    ccio = ccgo + int32(3) * cid
-                    ccio_v = vio + ccio
-                    mu_c = problem_mu[cio + cid]
-
-                    v_t0 = state_v_aug[ccio_v + 0]
-                    v_t1 = state_v_aug[ccio_v + 1]
-                    v_n = state_v_aug[ccio_v + 2] + mu_c * wp.sqrt(v_t0 * v_t0 + v_t1 * v_t1)
-                    v_c = vec3f(v_t0, v_t1, v_n)
-
-                    D_00 = wp.abs(problem_D[mio + ncts * (ccio + 0) + (ccio + 0)])
-                    D_11 = wp.abs(problem_D[mio + ncts * (ccio + 1) + (ccio + 1)])
-                    D_22 = wp.abs(problem_D[mio + ncts * (ccio + 2) + (ccio + 2)])
-
-                    lambda_old = vec3f(
-                        solution_lambdas[ccio_v + 0],
-                        solution_lambdas[ccio_v + 1],
-                        solution_lambdas[ccio_v + 2],
-                    )
-                    if cfg.contact_block_preconditioner:
-                        lambda_projected = _project_contact_block_update(
-                            lambda_old,
-                            v_c,
-                            vec3f(D_00, D_11, D_22),
-                            contact_block_inv[cio + cid],
-                            cfg.regularization,
-                            cfg.contact_jacobi_omega,
-                            mu_c,
-                        )
-                        lambda_new = lambda_old + cfg.contact_jacobi_relaxation * (lambda_projected - lambda_old)
-                    else:
-                        lambda_new = _project_contact_diagonal_update(
-                            lambda_old,
-                            v_c,
-                            _contact_trace_preconditioner(vec3f(D_00, D_11, D_22)),
-                            cfg.regularization,
-                            cfg.omega,
-                            mu_c,
-                        )
-
-                    delta = lambda_new - lambda_old
-                    solution_lambdas[ccio_v + 0] = lambda_new.x
-                    solution_lambdas[ccio_v + 1] = lambda_new.y
-                    solution_lambdas[ccio_v + 2] = lambda_new.z
-
-                    # Only contact velocities are read before all velocities are rebuilt.
-                    row = ccgo
-                    contact_end = ccgo + int32(3) * nc
-                    while row < contact_end:
-                        row_mio = mio + ncts * row
-                        dv = (
-                            problem_D[row_mio + ccio + 0] * delta.x
-                            + problem_D[row_mio + ccio + 1] * delta.y
-                            + problem_D[row_mio + ccio + 2] * delta.z
-                        )
-                        wp.atomic_add(state_v_aug, vio + row, dv)
-                        row = row + int32(1)
-
-                cid = cid + threads_per_world
-
-            _sync_threads()
-            color = color + int32(1)
-        iteration = iteration + int32(1)
+        for row in range(njc):
+            original_row = row
+            if use_permutation:
+                original_row = bilateral_permutation[bvio + row]
+            response[offset + original_row * unilateral_stride + unilateral] = (
+                bilateral_P[bvio + original_row] * response_factor[offset + row * unilateral_stride + unilateral]
+            )
 
 
 @wp.kernel
-def _compute_dvi_contact_jacobi_delta(
-    # Inputs:
+def _compute_dvi_unilateral_velocities(
     problem_dim: wp.array[int32],
     problem_mio: wp.array[int32],
     problem_vio: wp.array[int32],
+    problem_nbc: wp.array[int32],
+    problem_nl: wp.array[int32],
     problem_nc: wp.array[int32],
-    problem_ccgo: wp.array[int32],
-    problem_cio: wp.array[int32],
-    problem_mu: wp.array[float32],
-    problem_D: wp.array[float32],
-    block_iteration: int32,
-    contact_iteration: int32,
-    solver_config: wp.array[DVIConfigStruct],
-    contact_block_inv: wp.array[mat33f],
-    state_v_aug: wp.array[float32],
-    # Outputs:
-    solution_lambdas: wp.array[float32],
-    state_scratch: wp.array[float32],
-):
-    wid, cid = wp.tid()
-
-    nc = problem_nc[wid]
-    if cid >= nc:
-        return
-
-    ncts = problem_dim[wid]
-    vio = problem_vio[wid]
-    mio = problem_mio[wid]
-    ccgo = problem_ccgo[wid]
-    ccio = ccgo + int32(3) * cid
-    ccio_v = vio + ccio
-    mu_c = problem_mu[problem_cio[wid] + cid]
-    cfg = solver_config[wid]
-    if block_iteration >= cfg.block_iterations or contact_iteration >= cfg.contact_iterations:
-        return
-
-    # All contacts read the same velocity snapshot. Store impulse deltas so the
-    # companion kernel can apply their coupled Delassus effect simultaneously.
-    v_t0 = state_v_aug[ccio_v + 0]
-    v_t1 = state_v_aug[ccio_v + 1]
-    v_n = state_v_aug[ccio_v + 2] + mu_c * wp.sqrt(v_t0 * v_t0 + v_t1 * v_t1)
-    v_c = vec3f(v_t0, v_t1, v_n)
-    D_00 = wp.abs(problem_D[mio + ncts * (ccio + 0) + (ccio + 0)])
-    D_11 = wp.abs(problem_D[mio + ncts * (ccio + 1) + (ccio + 1)])
-    D_22 = wp.abs(problem_D[mio + ncts * (ccio + 2) + (ccio + 2)])
-
-    lambda_old = vec3f(
-        solution_lambdas[ccio_v + 0],
-        solution_lambdas[ccio_v + 1],
-        solution_lambdas[ccio_v + 2],
-    )
-    if cfg.contact_block_preconditioner:
-        lambda_projected = _project_contact_block_update(
-            lambda_old,
-            v_c,
-            vec3f(D_00, D_11, D_22),
-            contact_block_inv[problem_cio[wid] + cid],
-            cfg.regularization,
-            cfg.contact_jacobi_omega,
-            mu_c,
-        )
-    else:
-        lambda_projected = _project_contact_diagonal_update(
-            lambda_old,
-            v_c,
-            _contact_trace_preconditioner(vec3f(D_00, D_11, D_22)),
-            cfg.regularization,
-            cfg.contact_jacobi_omega,
-            mu_c,
-        )
-    lambda_new = lambda_old + cfg.contact_jacobi_relaxation * (lambda_projected - lambda_old)
-
-    delta = lambda_new - lambda_old
-    solution_lambdas[ccio_v + 0] = lambda_new.x
-    solution_lambdas[ccio_v + 1] = lambda_new.y
-    solution_lambdas[ccio_v + 2] = lambda_new.z
-    state_scratch[ccio_v + 0] = delta.x
-    state_scratch[ccio_v + 1] = delta.y
-    state_scratch[ccio_v + 2] = delta.z
-
-
-@wp.kernel
-def _apply_dvi_contact_jacobi_delta(
-    # Inputs:
-    problem_dim: wp.array[int32],
-    problem_mio: wp.array[int32],
-    problem_vio: wp.array[int32],
-    problem_nc: wp.array[int32],
-    problem_ccgo: wp.array[int32],
-    problem_D: wp.array[float32],
-    block_iteration: int32,
-    contact_iteration: int32,
-    solver_config: wp.array[DVIConfigStruct],
-    state_scratch: wp.array[float32],
-    # Outputs:
-    state_v_aug: wp.array[float32],
-):
-    wid, tid = wp.tid()
-
-    cfg = solver_config[wid]
-    if block_iteration >= cfg.block_iterations or contact_iteration >= cfg.contact_iterations:
-        return
-
-    nc = problem_nc[wid]
-    if tid >= int32(3) * nc:
-        return
-
-    ncts = problem_dim[wid]
-    vio = problem_vio[wid]
-    mio = problem_mio[wid]
-    ccgo = problem_ccgo[wid]
-    row = ccgo + tid
-    row_mio = mio + ncts * row
-
-    # Accumulate D_cc * delta_lambda for the Jacobi sweep; no contact observes
-    # another contact's new impulse until every delta has been formed.
-    dv = float32(0.0)
-    for cid in range(nc):
-        ccio = ccgo + int32(3) * cid
-        dv += problem_D[row_mio + ccio + 0] * state_scratch[vio + ccio + 0]
-        dv += problem_D[row_mio + ccio + 1] * state_scratch[vio + ccio + 1]
-        dv += problem_D[row_mio + ccio + 2] * state_scratch[vio + ccio + 2]
-
-    state_v_aug[vio + row] += dv
-
-
-@wp.kernel
-def _compute_dvi_contact_velocities(
-    # Inputs:
-    problem_dim: wp.array[int32],
-    problem_mio: wp.array[int32],
-    problem_vio: wp.array[int32],
-    problem_nc: wp.array[int32],
-    problem_ccgo: wp.array[int32],
+    problem_bcgo: wp.array[int32],
     problem_D: wp.array[float32],
     problem_v_f: wp.array[float32],
     solution_lambdas: wp.array[float32],
-    # Outputs:
     state_v_aug: wp.array[float32],
 ):
-    wid, tid = wp.tid()
-
-    if tid >= int32(3) * problem_nc[wid]:
+    """Evaluate every bounded, limit, and contact row at the current dual iterate."""
+    wid, local_row = wp.tid()
+    nbc = problem_nbc[wid]
+    nl = problem_nl[wid]
+    nc = problem_nc[wid]
+    unilateral_rows = nbc + nl + int32(3) * nc
+    if local_row >= unilateral_rows:
         return
-
     ncts = problem_dim[wid]
     mio = problem_mio[wid]
     vio = problem_vio[wid]
-    row = problem_ccgo[wid] + tid
+    row = problem_bcgo[wid] + local_row
     state_v_aug[vio + row] = _compute_row_velocity(ncts, mio, vio, row, problem_D, problem_v_f, solution_lambdas)
+
+
+@wp.func
+def _dense_unilateral_terminal_residuals(
+    nl: int32,
+    nc: int32,
+    lcgo: int32,
+    ccgo: int32,
+    cio: int32,
+    vio: int32,
+    lane: int32,
+    threads_per_world: int32,
+    problem_mu: wp.array[float32],
+    problem_P: wp.array[float32],
+    state_v_aug: wp.array[float32],
+    solution_lambdas: wp.array[float32],
+) -> vec3f:
+    """Return physical unilateral cone/complementarity residuals owned by one lane."""
+    r_p = float32(0.0)
+    r_d = float32(0.0)
+    r_c = float32(0.0)
+    for lid in range(lane, nl, threads_per_world):
+        row = vio + lcgo + lid
+        scale = problem_P[row]
+        lambda_l = scale * solution_lambdas[row]
+        velocity_l = state_v_aug[row] / scale
+        r_p = wp.max(r_p, wp.abs(lambda_l - wp.max(float32(0.0), lambda_l)))
+        r_d = wp.max(r_d, wp.abs(velocity_l - wp.max(float32(0.0), velocity_l)))
+        r_c = wp.max(r_c, wp.abs(lambda_l * velocity_l))
+    for cid in range(lane, nc, threads_per_world):
+        row = vio + ccgo + int32(3) * cid
+        lambda_c = vec3f(0.0)
+        velocity_c = vec3f(0.0)
+        for component in range(3):
+            scale = problem_P[row + component]
+            lambda_c[component] = scale * solution_lambdas[row + component]
+            velocity_c[component] = state_v_aug[row + component] / scale
+        mu_c = problem_mu[cio + cid]
+        velocity_c[2] += mu_c * wp.sqrt(velocity_c[0] * velocity_c[0] + velocity_c[1] * velocity_c[1])
+        lambda_projected = project_to_coulomb_cone(lambda_c, mu_c)
+        velocity_projected = project_to_coulomb_dual_cone(velocity_c, mu_c)
+        r_p = wp.max(r_p, wp.max(wp.abs(lambda_c - lambda_projected)))
+        r_d = wp.max(r_d, wp.max(wp.abs(velocity_c - velocity_projected)))
+        r_c = wp.max(r_c, wp.abs(wp.dot(lambda_c, velocity_c)))
+    return vec3f(r_p, r_d, r_c)
+
+
+@wp.kernel
+def _solve_dvi_inequalities_colored_pgs(
+    problem_dim: wp.array[int32],
+    problem_mio: wp.array[int32],
+    problem_vio: wp.array[int32],
+    problem_nbc: wp.array[int32],
+    problem_nl: wp.array[int32],
+    problem_nc: wp.array[int32],
+    problem_bcgo: wp.array[int32],
+    problem_lcgo: wp.array[int32],
+    problem_ccgo: wp.array[int32],
+    problem_bcio: wp.array[int32],
+    problem_cio: wp.array[int32],
+    problem_uio: wp.array[int32],
+    problem_mu: wp.array[float32],
+    problem_bound_lower: wp.array[float32],
+    problem_bound_upper: wp.array[float32],
+    problem_D: wp.array[float32],
+    problem_P: wp.array[float32],
+    problem_v_b: wp.array[float32],
+    block_iteration: int32,
+    inequality_num_colors: wp.array[int32],
+    inequality_ids_by_color: wp.array[int32],
+    inequality_color_starts: wp.array[int32],
+    solver_config: wp.array[DVIConfigStruct],
+    enable_adaptive: wp.bool,
+    solver_status: wp.array[DVIStatus],
+    state_delta: wp.array[float32],
+    state_v_aug: wp.array[float32],
+    solution_lambdas: wp.array[float32],
+):
+    """Apply one graph-colored PGS schedule to all DVI inequalities."""
+    tid = wp.tid()
+    threads_per_world = int32(wp.block_dim())
+    lane = tid % threads_per_world
+    wid = tid / threads_per_world
+    cfg = solver_config[wid]
+    if block_iteration >= int32(0) and block_iteration >= cfg.max_alternating_iterations:
+        return
+
+    nbc = problem_nbc[wid]
+    nl = problem_nl[wid]
+    nc = problem_nc[wid]
+    nu = nbc + nl + nc
+    if nu == 0:
+        if enable_adaptive and lane == int32(0):
+            status = solver_status[wid]
+            status.iterations = int32(1)
+            solver_status[wid] = status
+        return
+    ncts = problem_dim[wid]
+    mio = problem_mio[wid]
+    vio = problem_vio[wid]
+    bcgo = problem_bcgo[wid]
+    lcgo = problem_lcgo[wid]
+    ccgo = problem_ccgo[wid]
+    bcio = problem_bcio[wid]
+    cio = problem_cio[wid]
+    uio = problem_uio[wid]
+    schedule_offset = uio + wid
+    contact_end = ccgo + int32(3) * nc
+    sweep_count = cfg.inequality_sweeps_per_iteration
+    first_tangent_sweep = int32(0)
+    if block_iteration == int32(_FUSED_BILATERAL_BLOCK):
+        sweep_count *= cfg.max_alternating_iterations
+    elif block_iteration == int32(_FUSED_INEQUALITY_BLOCK):
+        tangent_sweep_count = sweep_count * cfg.max_alternating_iterations / int32(2)
+        sweep_count = (sweep_count + int32(1)) * cfg.max_alternating_iterations
+        first_tangent_sweep = sweep_count - tangent_sweep_count
+    adaptive = enable_adaptive and cfg.tolerance > float32(0.0)
+    completed_sweeps = sweep_count
+    pair_update = float32(0.0)
+    for _sweep in range(sweep_count):
+        sweep_update = float32(0.0)
+        phase_count = int32(2)
+        if block_iteration == int32(_FUSED_INEQUALITY_BLOCK) and _sweep < first_tangent_sweep:
+            # Establish the support load before friction in inequality-only solves.
+            phase_count = int32(1)
+        for phase in range(phase_count):
+            # Symmetric tangent ordering reduces load bias in redundant sticking patches.
+            reverse_colors = phase == int32(1) and _sweep % int32(2) != int32(0)
+            num_colors = inequality_num_colors[wid]
+            for color_index in range(num_colors):
+                color = color_index
+                if reverse_colors:
+                    color = num_colors - int32(1) - color_index
+                color_start = inequality_color_starts[schedule_offset + color]
+                color_end = inequality_color_starts[schedule_offset + color + int32(1)]
+                color_slot = color_start + lane
+                while color_slot < color_end:
+                    uid = inequality_ids_by_color[uio + color_slot]
+                    delta_0 = float32(0.0)
+                    delta_1 = float32(0.0)
+                    column = bcgo + uid
+                    column_count = int32(1)
+                    active = int32(1)
+                    if uid < nbc:
+                        if phase == int32(1):
+                            active = int32(0)
+                        else:
+                            vec_idx = vio + column
+                            bio = bcio + uid
+                            lambda_bound_old = solution_lambdas[vec_idx]
+                            diagonal = wp.abs(problem_D[mio + ncts * column + column])
+                            lambda_bound_new = _project_box_update(
+                                lambda_bound_old,
+                                state_v_aug[vec_idx],
+                                diagonal,
+                                cfg.regularization,
+                                cfg.omega,
+                                problem_bound_lower[bio],
+                                problem_bound_upper[bio],
+                            )
+                            solution_lambdas[vec_idx] = lambda_bound_new
+                            delta_0 = lambda_bound_new - lambda_bound_old
+                    elif uid < nbc + nl:
+                        column = lcgo + (uid - nbc)
+                        if phase == int32(1):
+                            active = int32(0)
+                        else:
+                            vec_idx = vio + column
+                            lambda_limit_old = solution_lambdas[vec_idx]
+                            diagonal = wp.abs(problem_D[mio + ncts * column + column])
+                            lambda_limit_new = lambda_limit_old
+                            if diagonal > FLOAT32_EPS:
+                                lambda_limit_new = wp.max(
+                                    float32(0.0),
+                                    lambda_limit_old
+                                    - cfg.omega * state_v_aug[vec_idx] / (diagonal + cfg.regularization),
+                                )
+                            solution_lambdas[vec_idx] = lambda_limit_new
+                            delta_0 = lambda_limit_new - lambda_limit_old
+                    else:
+                        cid = uid - nbc - nl
+                        column = ccgo + int32(3) * cid
+                        if phase == int32(0):
+                            column += int32(2)
+                            vec_idx = vio + column
+                            lambda_n_old = solution_lambdas[vec_idx]
+                            diagonal_n = wp.abs(problem_D[mio + ncts * column + column])
+                            lambda_n_new = _project_contact_normal_update(
+                                lambda_n_old,
+                                state_v_aug[vec_idx],
+                                diagonal_n,
+                                cfg.regularization,
+                                cfg.omega,
+                            )
+                            solution_lambdas[vec_idx] = lambda_n_new
+                            delta_0 = lambda_n_new - lambda_n_old
+                        else:
+                            column_count = int32(2)
+                            vec_idx = vio + column
+                            lambda_t0_old = solution_lambdas[vec_idx]
+                            lambda_t1_old = solution_lambdas[vec_idx + int32(1)]
+                            diagonal_t0 = wp.abs(problem_D[mio + ncts * column + column])
+                            diagonal_t1 = wp.abs(problem_D[mio + ncts * (column + int32(1)) + column + int32(1)])
+                            lambda_t_old = wp.vec2f(lambda_t0_old, lambda_t1_old)
+                            lambda_t_new = _project_contact_tangent_update(
+                                lambda_t_old,
+                                wp.vec2f(state_v_aug[vec_idx], state_v_aug[vec_idx + int32(1)]),
+                                wp.vec2f(diagonal_t0, diagonal_t1),
+                                problem_D[mio + ncts * column + column + int32(1)],
+                                cfg.regularization,
+                                cfg.omega,
+                                problem_mu[cio + cid]
+                                * _contact_friction_normal_load(
+                                    solution_lambdas[vec_idx + int32(2)],
+                                    problem_v_b[vec_idx + int32(2)],
+                                    problem_P[vec_idx + int32(2)],
+                                    wp.abs(problem_D[mio + ncts * (column + int32(2)) + column + int32(2)]),
+                                    cfg.regularization,
+                                    cfg.omega,
+                                ),
+                            )
+                            solution_lambdas[vec_idx] = lambda_t_new.x
+                            solution_lambdas[vec_idx + int32(1)] = lambda_t_new.y
+                            delta_0 = lambda_t_new.x - lambda_t_old.x
+                            delta_1 = lambda_t_new.y - lambda_t_old.y
+
+                    if active != int32(0):
+                        if adaptive:
+                            sweep_update = wp.max(sweep_update, wp.max(wp.abs(delta_0), wp.abs(delta_1)))
+                        state_delta[vio + column] = delta_0
+                        if column_count == int32(2):
+                            state_delta[vio + column + int32(1)] = delta_1
+                    color_slot += threads_per_world
+
+                # The projected updates above have one owner per inequality.
+                # Spread their dense velocity updates across the whole block;
+                # small contact colors would otherwise leave most lanes idle.
+                _sync_threads()
+                row_count = contact_end - bcgo
+                color_size = color_end - color_start
+                update_task = lane
+                while update_task < color_size * row_count:
+                    local_color_slot = update_task / row_count
+                    row = bcgo + update_task - local_color_slot * row_count
+                    uid = inequality_ids_by_color[uio + color_start + local_color_slot]
+                    active = int32(0)
+                    if uid >= nbc + nl or phase == int32(0):
+                        active = int32(1)
+                    if active != int32(0):
+                        column = bcgo + uid
+                        column_count = int32(1)
+                        if uid >= nbc + nl:
+                            cid = uid - nbc - nl
+                            column = ccgo + int32(3) * cid
+                            if phase == int32(0):
+                                column += int32(2)
+                            else:
+                                column_count = int32(2)
+                        elif uid >= nbc:
+                            column = lcgo + uid - nbc
+                        row_mio = mio + ncts * row
+                        dv = problem_D[row_mio + column] * state_delta[vio + column]
+                        if column_count == int32(2):
+                            dv += problem_D[row_mio + column + int32(1)] * state_delta[vio + column + int32(1)]
+                        wp.atomic_add(state_v_aug, vio + row, dv)
+                    update_task += threads_per_world
+                _sync_threads()
+
+        if adaptive:
+            sweep_update_max = wp.tile_max(wp.tile(sweep_update))[0]
+            pair_update = wp.max(pair_update, sweep_update_max)
+            if (_sweep + int32(1)) % int32(2) == int32(0):
+                if pair_update <= cfg.tolerance:
+                    local_residuals = _dense_unilateral_terminal_residuals(
+                        nl,
+                        nc,
+                        lcgo,
+                        ccgo,
+                        cio,
+                        vio,
+                        lane,
+                        threads_per_world,
+                        problem_mu,
+                        problem_P,
+                        state_v_aug,
+                        solution_lambdas,
+                    )
+                    r_p = wp.tile_max(wp.tile(local_residuals[0]))[0]
+                    r_d = wp.tile_max(wp.tile(local_residuals[1]))[0]
+                    r_c = wp.tile_max(wp.tile(local_residuals[2]))[0]
+                    if r_p <= cfg.tolerance and r_d <= cfg.tolerance and r_c <= cfg.tolerance:
+                        completed_sweeps = _sweep + int32(1)
+                        break
+                pair_update = float32(0.0)
+
+    if enable_adaptive and lane == int32(0):
+        status = solver_status[wid]
+        status.iterations = completed_sweeps
+        solver_status[wid] = status
 
 
 @wp.kernel
