@@ -15,12 +15,15 @@ Input semantics (see README_braid.md for the schema):
     ``samples`` centerline vertices (default DEFAULT_SAMPLES, endpoints included, JSON only).
   * Both end vertices are pinned in position with ball joints, so their orientation
     is free. All interior capsule bodies are dynamic.
-  * ``steps`` run sequentially, each lasting ``step_duration`` seconds (default 1.0).
-    Every entry within a step, across all of its turns, moves simultaneously. Each
-    entry moves one yarn's bottom vertex along the circular arc through its
-    ``start``, ``mid`` and ``end`` at uniform angular speed. Yarns absent from a step
-    hold position. After the last step all targets hold while physics continues.
+  * Every turn of every step runs in order, each lasting ``turn_duration`` seconds (default 1.0);
+    how turns are grouped into steps does not change the motion. The movements of one turn
+    (one actuator) move simultaneously. Each moves one yarn's bottom vertex along the circular
+    arc through its ``start``, ``mid`` and ``end`` at uniform angular speed, or straight from
+    ``start`` to ``end`` when ``mid`` equals ``start``. Yarns absent from a turn hold position.
+    After the last turn all targets hold while physics continues. ``--steps N`` uses only the
+    first N steps.
   * ``feed`` is validated but not simulated; a warning is issued if any is nonzero.
+  * Movements of type ``takeup`` are ignored with a warning; a turn of takeups only takes no time.
   * On CUDA, one frame's substeps are captured as a CUDA graph and replayed each frame; bottom
     targets for every substep are precomputed into a device table for that reason.
 
@@ -68,7 +71,18 @@ DEFAULT_PHYSICS = {
     "friction": 1.0,
     "ground_height": None,
 }
-COLORS = ((0.9, 0.25, 0.18), (0.15, 0.65, 0.95), (0.25, 0.8, 0.35), (0.95, 0.65, 0.12))
+COLORS = (
+    (0.9, 0.25, 0.18),
+    (0.15, 0.65, 0.95),
+    (0.25, 0.8, 0.35),
+    (0.95, 0.65, 0.12),
+    (0.65, 0.35, 0.9),
+    (0.95, 0.4, 0.7),
+    (0.1, 0.8, 0.75),
+    (0.6, 0.45, 0.25),
+    (0.85, 0.85, 0.2),
+    (0.9, 0.9, 0.9),
+)
 # Tolerance for a step's start matching the yarn's current bottom position [m].
 CONTINUITY_TOLERANCE = 1.0e-6
 # Centerline vertices per yarn when the JSON omits "samples", endpoints included.
@@ -134,6 +148,20 @@ class Arc:
 
 
 @dataclass
+class Line:
+    """Straight move from start to end at uniform speed: an arc movement whose mid equals its start."""
+
+    start: np.ndarray
+    """Start point [m]."""
+    end: np.ndarray
+    """End point [m]."""
+
+    def position(self, fraction: float) -> np.ndarray:
+        """Position [m] at a fraction in [0, 1] of the segment, clamped."""
+        return self.start + min(1.0, max(0.0, fraction)) * (self.end - self.start)
+
+
+@dataclass
 class SceneConfig:
     """Validated initial geometry, bottom-vertex motion, and settings in SI units."""
 
@@ -151,19 +179,21 @@ class SceneConfig:
     diameter: float
     physics: dict
     cables: list[Cable]
-    step_duration: float
-    """Duration of every step [s]."""
-    steps: list[dict[int, Arc]]
-    """Per step, the moving cables by cable index; absent cables hold position."""
+    turn_duration: float
+    """Duration of every turn [s]."""
+    turns: list[dict[int, Arc | Line]]
+    """Per turn, in playback order, the moving cables by cable index; absent cables hold position."""
+    turn_steps: list[int]
+    """Index of the JSON step each turn belongs to."""
     bottom_keyframes: np.ndarray
-    """Bottom positions [m] after k completed steps, shape [step_count + 1, cable_count, 3]."""
+    """Bottom positions [m] after k completed turns, shape [turn_count + 1, cable_count, 3]."""
     feed: np.ndarray
-    """Feed values parsed from the input (unused), shape [step_count, cable_count]."""
+    """Feed values parsed from the input (unused), shape [turn_count, cable_count]."""
 
     @property
     def playback_duration(self) -> float:
         """Total bottom motion duration [s]."""
-        return len(self.steps) * self.step_duration
+        return len(self.turns) * self.turn_duration
 
     @property
     def default_num_frames(self) -> int:
@@ -172,22 +202,25 @@ class SceneConfig:
 
     def bottom_positions(self, time: float) -> np.ndarray:
         """Bottom vertex positions [m] at simulation time [s], shape [cable_count, 3]."""
-        if time >= self.playback_duration or not self.steps:
+        if time >= self.playback_duration or not self.turns:
             return self.bottom_keyframes[-1].copy()
-        phase = max(0.0, time) / self.step_duration
-        index = min(math.floor(phase), len(self.steps) - 1)
+        phase = max(0.0, time) / self.turn_duration
+        index = min(math.floor(phase), len(self.turns) - 1)
         positions = self.bottom_keyframes[index].copy()
-        for cable_index, arc in self.steps[index].items():
-            positions[cable_index] = arc.position(phase - index)
+        for cable_index, path in self.turns[index].items():
+            positions[cable_index] = path.position(phase - index)
         return positions
 
-    def moving_yarns(self, step_index: int) -> list[int]:
-        """Yarn IDs that move during a step, in cable order."""
-        return [self.cables[i].yarn for i in sorted(self.steps[step_index])]
+    def moving_yarns(self, turn_index: int) -> list[int]:
+        """Yarn IDs that move during a turn, in cable order."""
+        return [self.cables[i].yarn for i in sorted(self.turns[turn_index])]
 
     @classmethod
-    def load(cls, path: str | Path) -> SceneConfig:
-        """Load initial yarns and arc steps, applying defaults only to missing properties."""
+    def load(cls, path: str | Path, step_count: int | None = None) -> SceneConfig:
+        """Load initial yarns and the turns of the first ``step_count`` steps (all when None).
+
+        Defaults apply only to missing properties.
+        """
         with Path(path).open(encoding="utf-8") as stream:
             data = json.load(stream)
         if not isinstance(data, dict):
@@ -201,9 +234,9 @@ class SceneConfig:
         diameter = _number(data.get("yarn_diameter", 0.002), "yarn_diameter")
         if diameter <= 0:
             raise ValueError("yarn_diameter must be positive")
-        step_duration = _number(data.get("step_duration", 1.0), "step_duration")
-        if step_duration <= 0:
-            raise ValueError("step_duration must be positive [s]")
+        turn_duration = _number(data.get("turn_duration", 1.0), "turn_duration")
+        if turn_duration <= 0:
+            raise ValueError("turn_duration must be positive [s]")
         physics = cls._load_physics(data.get("physics", {}))
 
         yarns = data.get("yarns")
@@ -227,31 +260,41 @@ class SceneConfig:
         steps_data = data.get("steps", [])
         if not isinstance(steps_data, list):
             raise ValueError("steps must be a list")
-        if not math.isfinite(60 * (len(steps_data) * step_duration + 1)):
-            raise ValueError("step_duration produces a nonfinite playback length")
+        if step_count is not None:
+            if step_count < 0:
+                raise ValueError("the step count must be nonnegative")
+            steps_data = steps_data[:step_count]
         current = np.array([cable.bottom for cable in cables])
         keyframes = [current.copy()]
-        steps = []
-        feed = np.zeros((len(steps_data), len(cables)))
+        turns = []
+        turn_steps = []
+        feed = []
+        takeup = False
         for index, step in enumerate(steps_data):
             if not isinstance(step, list) or not step:
                 raise ValueError(f"steps[{index}] must be a nonempty list of turns")
-            arcs = {}
-            for turn in step:
+            for turn_index, turn in enumerate(step):
                 if not isinstance(turn, list) or not turn:
                     raise ValueError(f"Each turn in step {index} must be a nonempty list of movements")
+                paths = {}
+                turn_feed = np.zeros(len(cables))
                 for item in turn:
                     if not isinstance(item, dict):
                         raise ValueError(f"Each movement in step {index} must be an object")
+                    if item.get("type") == "takeup":
+                        takeup = True
+                        continue
                     yarn = item.get("yarn")
                     if yarn not in cable_index:
                         raise ValueError(f"Step {index} references unknown yarn {yarn!r}")
-                    name = f"step {index} yarn {yarn}"
+                    name = f"step {index} turn {turn_index} yarn {yarn}"
                     i = cable_index[yarn]
-                    if i in arcs:
-                        raise ValueError(f"{name} appears more than once in the step")
+                    if i in paths:
+                        raise ValueError(f"{name} appears more than once in the turn")
                     if item.get("type") != "arc":
-                        raise ValueError(f"{name}: only type 'arc' is supported, got {item.get('type')!r}")
+                        raise ValueError(
+                            f"{name}: only types 'arc' and 'takeup' are supported, got {item.get('type')!r}"
+                        )
                     start = _vector(item.get("start"), f"{name} start")
                     mid = _vector(item.get("mid"), f"{name} mid")
                     end = _vector(item.get("end"), f"{name} end")
@@ -259,17 +302,29 @@ class SceneConfig:
                         raise ValueError(
                             f"{name}: start {start.tolist()} does not match the current bottom {current[i].tolist()}"
                         )
-                    arcs[i] = Arc.through(start, mid, end, name)
-                    feed[index, i] = _number(item.get("feed", 0.0), f"{name} feed")
-            for i, arc in arcs.items():
-                current[i] = arc.position(1.0)
-            steps.append(arcs)
-            keyframes.append(current.copy())
+                    if np.linalg.norm(mid - start) <= CONTINUITY_TOLERANCE:
+                        paths[i] = Line(start, end)
+                    else:
+                        paths[i] = Arc.through(start, mid, end, name)
+                    turn_feed[i] = _number(item.get("feed", 0.0), f"{name} feed")
+                if not paths:
+                    continue
+                for i, path in paths.items():
+                    current[i] = path.position(1.0)
+                turns.append(paths)
+                turn_steps.append(index)
+                feed.append(turn_feed)
+                keyframes.append(current.copy())
+        if not math.isfinite(60 * (len(turns) * turn_duration + 1)):
+            raise ValueError("turn_duration produces a nonfinite playback length")
+        if takeup:
+            warnings.warn("takeup movements are present but not simulated; they are ignored.", stacklevel=2)
+        feed = np.array(feed).reshape(len(turns), len(cables))
         if np.any(feed != 0.0):
             warnings.warn(
                 "Nonzero feed values are present but feed is not simulated; yarn length stays fixed.", stacklevel=2
             )
-        return cls(samples, diameter, physics, cables, step_duration, steps, np.array(keyframes), feed)
+        return cls(samples, diameter, physics, cables, turn_duration, turns, turn_steps, np.array(keyframes), feed)
 
     @staticmethod
     def _load_physics(supplied) -> dict:
@@ -370,11 +425,11 @@ def build_scene(config: SceneConfig, device=None) -> tuple[newton.Model, list[li
 
 
 class Example:
-    """Advance cable physics while commanding bottom vertex positions along JSON arcs."""
+    """Advance cable physics while commanding bottom vertex positions along JSON arcs, one turn at a time."""
 
     def __init__(self, viewer, args, config: SceneConfig | None = None):
         self.viewer = viewer
-        self.config = config if config is not None else SceneConfig.load(args.input)
+        self.config = config if config is not None else SceneConfig.load(args.input, args.steps)
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
         # Even, so the captured state_0/state_1 swaps return to the starting buffers each frame.
@@ -416,16 +471,18 @@ class Example:
         )
         print(f"Yarn diameter [m]: {self.config.diameter}; physics: {json.dumps(self.config.physics, sort_keys=True)}")
         print(
-            f"Steps: {len(self.config.steps)}; step duration: {self.config.step_duration:g} s; "
+            f"Turns: {len(self.config.turns)}; turn duration: {self.config.turn_duration:g} s; "
             f"playback: {self.config.playback_duration:g} s, then hold"
         )
-        for index in range(len(self.config.steps)):
-            print(f"  step {index}: moving yarns {self.config.moving_yarns(index)}")
+        for index in range(len(self.config.turns)):
+            print(
+                f"  turn {index} (step {self.config.turn_steps[index]}): moving yarns {self.config.moving_yarns(index)}"
+            )
 
     def _frame_camera(self):
         points = [self.config.bottom_keyframes.reshape(-1, 3), np.array([c.top for c in self.config.cables])]
-        for step in self.config.steps:
-            points.extend(arc.position(0.5)[None, :] for arc in step.values())
+        for turn in self.config.turns:
+            points.extend(path.position(0.5)[None, :] for path in turn.values())
         points = np.concatenate(points)
         center = (points.min(axis=0) + points.max(axis=0)) * 0.5
         extent = max(float(np.linalg.norm(np.ptp(points, axis=0))), self.config.diameter * 10)
@@ -513,6 +570,7 @@ class Example:
         """Expose input selection and standard viewer options; samples belong in JSON."""
         parser = newton.examples.create_parser()
         parser.add_argument("--input", type=Path, default=AGENT_DIR / "braid4_feed.json")
+        parser.add_argument("--steps", type=int, default=None, help="use only the input's first N steps")
         parser.set_defaults(
             paused=True, num_frames=None, render_fps=60.0, output_path=str(AGENT_DIR / "braid_initial.usd")
         )
@@ -522,7 +580,7 @@ class Example:
 def load_run_config(parser, argv=None) -> SceneConfig:
     """Validate input and set a duration-based frame default before creating the viewer."""
     args = parser.parse_args(argv)
-    config = SceneConfig.load(args.input)
+    config = SceneConfig.load(args.input, args.steps)
     parser.set_defaults(num_frames=config.default_num_frames)
     return config
 
