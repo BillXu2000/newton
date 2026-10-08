@@ -26,9 +26,10 @@ AGENT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(AGENT_DIR))
 os.environ.setdefault("WARP_CACHE_PATH", str(AGENT_DIR / "cache" / "warp"))
 
-from example_cable_braid import DEFAULT_SAMPLES, Arc, Example, SceneConfig  # noqa: E402
+from example_cable_braid import DEFAULT_SAMPLES, Arc, Example, Line, SceneConfig  # noqa: E402
 
 INPUT_PATH = AGENT_DIR / "braid4_feed.json"
+WOVEN_PATH = AGENT_DIR / "woven3x3_tension.json"
 
 
 def _write_json(data: dict) -> Path:
@@ -106,57 +107,117 @@ class TestSceneConfig(unittest.TestCase):
             lengths = np.linalg.norm(np.diff(cable.points, axis=0), axis=1)
             np.testing.assert_allclose(lengths, lengths[0])
 
-    def test_step_schedule(self):
-        """Read eight sequential steps with per-step moving-yarn sets and a nine-second default run."""
+    def test_turn_schedule(self):
+        """Run the twelve turns of eight steps one after another, with a thirteen-second default run."""
         config = self.config
-        self.assertEqual(len(config.steps), 8)
+        self.assertEqual(len(config.turns), 12)
         self.assertEqual(
-            [config.moving_yarns(i) for i in range(8)],
-            [[0, 1, 2, 3], [0, 3], [0, 1, 2, 3], [1, 2]] * 2,
+            [config.moving_yarns(i) for i in range(12)],
+            [sorted(item["yarn"] for item in turn) for step in self.data["steps"] for turn in step],
         )
-        self.assertEqual(config.step_duration, 1.0)
-        self.assertEqual(config.playback_duration, 8.0)
-        self.assertEqual(config.default_num_frames, 540)
+        self.assertEqual(config.turn_steps, [0, 0, 1, 2, 2, 3, 4, 4, 5, 6, 6, 7])
+        self.assertEqual(config.turn_duration, 1.0)
+        self.assertEqual(config.playback_duration, 12.0)
+        self.assertEqual(config.default_num_frames, 780)
 
     def test_bottom_positions_follow_arcs_and_hold(self):
-        """Evaluate bottom targets mid-arc, at step boundaries, for holding yarns, and after playback."""
+        """Evaluate bottom targets mid-arc, at turn boundaries, for holding yarns, and after playback."""
         config = self.config
         bottoms = np.array([y["bottom"] for y in self.data["yarns"]])
         np.testing.assert_allclose(config.bottom_positions(0.0), bottoms)
         np.testing.assert_allclose(config.bottom_positions(-1.0), bottoms)
-        # Halfway through step 0, every yarn is at its mid point.
-        expected_mid = np.array([[-0.021, 0.021, 0.0], [0.021, 0.021, 0.0], [-0.021, 0.105, 0.0], [0.021, 0.105, 0.0]])
-        np.testing.assert_allclose(config.bottom_positions(0.5), expected_mid, atol=1e-12)
-        # A quarter through step 0, yarn 0 is 45 degrees along its semicircle.
+        # Halfway through turn 0 (step 0), yarns 0 and 1 are at their mid points; yarns 2 and 3 wait.
+        at_0_5 = config.bottom_positions(0.5)
+        np.testing.assert_allclose(at_0_5[:2], [[-0.021, 0.021, 0.0], [0.021, 0.021, 0.0]], atol=1e-12)
+        np.testing.assert_allclose(at_0_5[2:], bottoms[2:], atol=1e-12)
+        # A quarter through turn 0, yarn 0 is 45 degrees along its semicircle.
         quarter = np.array([-0.021 * math.sin(math.pi / 4), 0.021 - 0.021 * math.cos(math.pi / 4), 0.0])
         np.testing.assert_allclose(config.bottom_positions(0.25)[0], quarter, atol=1e-12)
-        # End of step 0 equals each yarn's end.
-        expected_end = np.array([[0.0, 0.042, 0.0], [0.0, 0.0, 0.0], [0.0, 0.126, 0.0], [0.0, 0.084, 0.0]])
-        np.testing.assert_allclose(config.bottom_positions(1.0), expected_end, atol=1e-12)
-        # During step 1 only yarns 0 and 3 move; yarns 1 and 2 hold their step-0 end positions.
+        # Halfway through turn 1 (still step 0), yarns 2 and 3 move while 0 and 1 hold their ends.
         at_1_5 = config.bottom_positions(1.5)
-        np.testing.assert_allclose(at_1_5[1], expected_end[1], atol=1e-12)
-        np.testing.assert_allclose(at_1_5[2], expected_end[2], atol=1e-12)
-        np.testing.assert_allclose(at_1_5[0], [0.021, 0.063, 0.0], atol=1e-12)
-        np.testing.assert_allclose(at_1_5[3], [-0.021, 0.063, 0.0], atol=1e-12)
+        np.testing.assert_allclose(at_1_5[:2], [[0.0, 0.042, 0.0], [0.0, 0.0, 0.0]], atol=1e-12)
+        np.testing.assert_allclose(at_1_5[2:], [[-0.021, 0.105, 0.0], [0.021, 0.105, 0.0]], atol=1e-12)
+        # After both turns of step 0, every yarn is at its end.
+        expected_end = np.array([[0.0, 0.042, 0.0], [0.0, 0.0, 0.0], [0.0, 0.126, 0.0], [0.0, 0.084, 0.0]])
+        np.testing.assert_allclose(config.bottom_positions(2.0), expected_end, atol=1e-12)
+        # During turn 2 (step 1) only yarns 0 and 3 move.
+        at_2_5 = config.bottom_positions(2.5)
+        np.testing.assert_allclose(at_2_5[[1, 2]], expected_end[[1, 2]], atol=1e-12)
+        np.testing.assert_allclose(at_2_5[[0, 3]], [[0.021, 0.063, 0.0], [-0.021, 0.063, 0.0]], atol=1e-12)
         # The sequence returns to the initial layout and then holds.
-        np.testing.assert_allclose(config.bottom_positions(8.0), bottoms, atol=1e-12)
+        np.testing.assert_allclose(config.bottom_positions(12.0), bottoms, atol=1e-12)
         np.testing.assert_allclose(config.bottom_positions(50.0), bottoms, atol=1e-12)
 
-    def test_step_duration_override(self):
-        """Scale the schedule by a JSON step_duration."""
+    def test_step_grouping_does_not_change_motion(self):
+        """Regrouping all turns into one step gives the same turns and targets."""
         data = copy.deepcopy(self.data)
-        data["step_duration"] = 0.5
+        data["steps"] = [[turn for step in data["steps"] for turn in step]]
         config = _load_quiet(_write_json(data))
-        self.assertEqual(config.playback_duration, 4.0)
-        self.assertEqual(config.default_num_frames, 300)
+        self.assertEqual(len(config.turns), 12)
+        for time in np.linspace(0.0, 13.0, 53):
+            np.testing.assert_allclose(config.bottom_positions(time), self.config.bottom_positions(time), atol=1e-12)
+
+    def test_turn_duration_override(self):
+        """Scale the schedule by a JSON turn_duration."""
+        data = copy.deepcopy(self.data)
+        data["turn_duration"] = 0.5
+        config = _load_quiet(_write_json(data))
+        self.assertEqual(config.playback_duration, 6.0)
+        self.assertEqual(config.default_num_frames, 420)
         np.testing.assert_allclose(config.bottom_positions(0.25), self.config.bottom_positions(0.5), atol=1e-12)
+
+    def test_step_count_limit(self):
+        """Load only the turns of the first steps."""
+        config = SceneConfig.load(INPUT_PATH, 1)
+        self.assertEqual(len(config.turns), 2)
+        self.assertEqual(config.playback_duration, 2.0)
+        np.testing.assert_allclose(config.bottom_positions(5.0), self.config.bottom_positions(2.0), atol=1e-12)
+
+    def test_takeup_is_ignored_and_warned(self):
+        """Skip takeup movements with a warning; a turn of takeups only takes no time."""
+        data = copy.deepcopy(self.data)
+        data["steps"][0].insert(1, [{"type": "takeup", "distance": 0.002, "weft_axis": "y"}])
+        data["steps"][1][0].append({"type": "takeup", "distance": 0.002, "weft_axis": "x"})
+        with self.assertWarnsRegex(UserWarning, "takeup"):
+            config = SceneConfig.load(_write_json(data))
+        self.assertEqual(len(config.turns), 12)
+        np.testing.assert_allclose(config.bottom_keyframes, self.config.bottom_keyframes, atol=1e-12)
+
+    def test_mid_equal_to_start_moves_straight(self):
+        """An arc movement whose mid equals its start moves straight to its end."""
+        data = copy.deepcopy(self.data)
+        data["steps"].append(
+            [
+                [
+                    {
+                        "yarn": 0,
+                        "type": "arc",
+                        "start": [0.0, 0.0, 0.0],
+                        "mid": [0.0, 0.0, 0.0],
+                        "end": [0.021, -0.021, 0.0],
+                    }
+                ]
+            ]
+        )
+        config = _load_quiet(_write_json(data))
+        self.assertIsInstance(config.turns[-1][0], Line)
+        np.testing.assert_allclose(config.bottom_positions(12.5)[0], [0.0105, -0.0105, 0.0], atol=1e-12)
+        np.testing.assert_allclose(config.bottom_positions(13.0)[0], [0.021, -0.021, 0.0], atol=1e-12)
+
+    def test_woven_input(self):
+        """Load the 10-yarn woven input: 100 turns of arcs and straight moves; takeups ignored."""
+        with self.assertWarnsRegex(UserWarning, "takeup"):
+            config = SceneConfig.load(WOVEN_PATH)
+        self.assertEqual(len(config.cables), 10)
+        self.assertEqual(len(config.turns), 100)
+        self.assertEqual(sum(isinstance(p, Line) for turn in config.turns for p in turn.values()), 64)
+        self.assertEqual(len(SceneConfig.load(WOVEN_PATH, 1).turns), 14)
 
     def test_feed_is_parsed_and_warned(self):
         """Record feed values and warn that they are not simulated."""
         with self.assertWarns(UserWarning):
             config = SceneConfig.load(INPUT_PATH)
-        self.assertEqual(config.feed.shape, (8, 4))
+        self.assertEqual(config.feed.shape, (12, 4))
         self.assertAlmostEqual(config.feed[0, 0], -0.00514)
         np.testing.assert_allclose(config.feed.sum(axis=0), 0.0, atol=1e-12)
         data = copy.deepcopy(self.data)
@@ -199,8 +260,8 @@ class TestSceneConfig(unittest.TestCase):
 
         self._assert_rejects(mutate, "unknown yarn")
 
-    def test_rejects_duplicate_yarn_within_step(self):
-        """Reject a yarn that moves twice within a single step."""
+    def test_rejects_duplicate_yarn_within_turn(self):
+        """Reject a yarn that moves twice within a single turn."""
 
         def mutate(data):
             data["steps"][1][0].append(copy.deepcopy(data["steps"][1][0][0]))
@@ -208,12 +269,12 @@ class TestSceneConfig(unittest.TestCase):
         self._assert_rejects(mutate, "more than once")
 
     def test_rejects_non_arc_type(self):
-        """Reject movement types other than arc."""
+        """Reject movement types other than arc and takeup."""
 
         def mutate(data):
             data["steps"][0][0][0]["type"] = "line"
 
-        self._assert_rejects(mutate, "only type 'arc'")
+        self._assert_rejects(mutate, "only types 'arc' and 'takeup'")
 
     def test_rejects_bad_geometry(self):
         """Reject collinear arc points and duplicate yarn IDs."""
@@ -244,17 +305,17 @@ class TestSceneConfig(unittest.TestCase):
 
 class TestTracking(unittest.TestCase):
     def test_bottom_pins_track_arcs_cpu(self):
-        """Simulate the first two steps on CPU and keep pinned endpoints on their targets every frame.
+        """Simulate the first two steps (three turns) on CPU and keep pinned endpoints on their targets every frame.
 
-        Uses a half-second step so the run covers a full semicircle exchange, a
-        partial step where two yarns hold, and final holding, within 120 frames.
+        Uses a half-second turn so the run covers semicircle exchanges while other yarns hold, and final
+        holding, within 150 frames.
         """
         import newton  # noqa: PLC0415
 
         with INPUT_PATH.open(encoding="utf-8") as stream:
             data = json.load(stream)
         data["steps"] = data["steps"][:2]
-        data["step_duration"] = 0.5
+        data["turn_duration"] = 0.5
         path = _write_json(data)
         config = _load_quiet(path)
         parser = Example.create_parser()
@@ -304,8 +365,8 @@ class TestGraphCapture(unittest.TestCase):
     def test_graph_replay_matches_eager_cuda(self):
         """Replay the captured frame graph on CUDA and match eager execution of the same substeps.
 
-        Covers the first 1.5 s of the supplied input: a full step with all yarns moving and half of a
-        step where two hold. The graph run must also advance its device-side targets every frame.
+        Covers the first 1.5 s of the supplied input: one full turn and half of the next, two yarns
+        moving and two holding in each. The graph run must also advance its device-side targets every frame.
         """
         import newton  # noqa: PLC0415
 
